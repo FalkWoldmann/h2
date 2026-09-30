@@ -14,7 +14,7 @@ use std::io;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::AsyncRead;
+use futures::io::AsyncRead;
 use tokio_util::codec::FramedRead as InnerFramedRead;
 use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
 
@@ -421,7 +421,7 @@ where
         let _e = span.enter();
         loop {
             tracing::trace!("poll");
-            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+            let bytes = match ready!(Pin::new(&mut self.inner).next(cx)) {
                 Some(Ok(bytes)) => bytes,
                 Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
                 None => return Poll::Ready(None),

@@ -42,8 +42,7 @@ members = [
 atomic-waker = "1.0.0"
 futures-core = { version = "0.3", default-features = false }
 futures-sink = { version = "0.3", default-features = false }
-tokio-util = { version = "0.7.1", features = ["codec", "io"] }
-tokio = { version = "1", features = ["io-util"] }
+futures = { version = "0.3"}
 bytes = "1"
 http = "1.1"
 tracing = { version = "0.1.35", default-features = false, features = ["std"] }

@@ -15,7 +15,7 @@ use futures_core::Stream;
 use futures_sink::Sink;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite};
+use futures::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::length_delimited;
 
 use std::io;

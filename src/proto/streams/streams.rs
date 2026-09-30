@@ -10,7 +10,7 @@ use crate::{client, proto, server};
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
 use std::task::{Context, Poll, Waker};
-use tokio::io::AsyncWrite;
+use futures::io::AsyncWrite;
 
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};

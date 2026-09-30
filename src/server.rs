@@ -127,7 +127,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{fmt, io};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use futures::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::instrument::{Instrument, Instrumented};
 
 /// In progress HTTP/2 connection handshake future.

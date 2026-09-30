@@ -6,7 +6,7 @@ use crate::hpack;
 use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use futures::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::poll_write_buf;
 
 use std::io::{self, Cursor};

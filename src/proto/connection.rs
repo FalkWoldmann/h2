@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::AsyncRead;
+use futures::io::AsyncRead;
 
 /// An H2 connection
 #[derive(Debug)]
