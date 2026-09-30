@@ -8,13 +8,14 @@ use crate::hpack;
 
 use futures_core::Stream;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 
+use std::future::Future;
 use std::io;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
@@ -485,7 +486,7 @@ where
             // Make sure there is room for at least one byte, so a read of 0
             // bytes means EOF.
             self.buf.reserve(1);
-            let n = match poll_read_buf(Pin::new(&mut self.inner), cx, &mut self.buf) {
+            let n = match poll_read_buf(&mut self.inner, cx, &mut self.buf) {
                 Poll::Ready(Ok(n)) => n,
                 Poll::Ready(Err(e)) => {
                     self.state.has_errored = true;
@@ -537,7 +538,8 @@ where
         let bytes = self.buf.split_to(frame_len);
 
         // Make sure there is room to read the next frame head
-        self.buf.reserve(frame::HEADER_LEN.saturating_sub(self.buf.len()));
+        self.buf
+            .reserve(frame::HEADER_LEN.saturating_sub(self.buf.len()));
 
         Ok(Some(bytes))
     }
@@ -580,37 +582,16 @@ where
 }
 
 /// Reads from `io` into the spare capacity of `buf`.
-fn poll_read_buf<T: AsyncRead>(
-    io: Pin<&mut T>,
+fn poll_read_buf<T: AsyncRead + Unpin>(
+    io: &mut T,
     cx: &mut Context<'_>,
     buf: &mut BytesMut,
 ) -> Poll<io::Result<usize>> {
-    if !buf.has_remaining_mut() {
-        return Poll::Ready(Ok(0));
-    }
-
-    let n = {
-        let dst = buf.chunk_mut();
-
-        // SAFETY: `UninitSlice` is a transparent wrapper around
-        // `[MaybeUninit<u8>]`, and `ReadBuf` never de-initializes memory.
-        let dst = unsafe { dst.as_uninit_slice_mut() };
-        let mut read_buf = ReadBuf::uninit(dst);
-        let ptr = read_buf.filled().as_ptr();
-        ready!(io.poll_read(cx, &mut read_buf))?;
-
-        // Make sure the reader didn't swap out the buffer
-        assert_eq!(ptr, read_buf.filled().as_ptr());
-        read_buf.filled().len()
-    };
-
-    // SAFETY: `ReadBuf::filled` guarantees that its first `n` bytes, which are
-    // the first `n` bytes of `buf`'s spare capacity, are initialized.
-    unsafe {
-        buf.advance_mut(n);
-    }
-
-    Poll::Ready(Ok(n))
+    // `read_buf` is cancel safe, so a new future can be polled on every call
+    // and dropped when it returns `Pending`.
+    let read = io.read_buf(buf);
+    tokio::pin!(read);
+    read.poll(cx)
 }
 
 // ===== impl Continuable =====

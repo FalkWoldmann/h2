@@ -308,7 +308,8 @@ async fn update_max_frame_len_in_flight() {
     codec.set_max_recv_frame_size(16_385);
 
     // Read the head of the first frame, then wait for its payload
-    let res = futures::future::poll_fn(|cx| std::task::Poll::Ready(codec.poll_next_unpin(cx))).await;
+    let res =
+        futures::future::poll_fn(|cx| std::task::Poll::Ready(codec.poll_next_unpin(cx))).await;
     assert!(res.is_pending());
 
     // The frame in flight was accepted under the old setting, so it is still
