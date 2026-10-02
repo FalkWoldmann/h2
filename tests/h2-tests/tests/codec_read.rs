@@ -86,6 +86,45 @@ async fn read_partial_frame_at_eof() {
     assert_closed!(codec);
 }
 
+#[tokio::test]
+async fn read_partial_length_field_at_eof() {
+    use futures::StreamExt;
+
+    let mut codec = raw_codec! {
+        read => [
+            0, 0,
+        ];
+    };
+
+    assert_eq!(
+        codec.next().await.unwrap().unwrap_err().to_string(),
+        "bytes remaining on stream"
+    );
+
+    assert_closed!(codec);
+}
+
+#[tokio::test]
+async fn read_io_error_then_none() {
+    use futures::StreamExt;
+
+    let mut codec = Codec::from(
+        mock_io::Builder::new()
+            .read_error(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            ))
+            .build(),
+    );
+
+    assert_eq!(
+        codec.next().await.unwrap().unwrap_err().to_string(),
+        "reset"
+    );
+
+    assert!(codec.next().await.is_none());
+}
+
 // ===== DATA =====
 
 #[tokio::test]
