@@ -33,27 +33,16 @@ pub struct FramedRead<T> {
     /// Bytes read from `inner` that have not been split into frames yet
     buf: BytesMut,
 
-    state: ReadState,
-
-    max_frame_size: usize,
-
-    decoder: FrameDecoder,
-}
-
-#[derive(Debug, Default)]
-struct ReadState {
     /// Total length (head and payload) of the frame at the front of `buf`,
     /// set once its length field has been checked against the max frame size
     frame_len: Option<usize>,
 
-    /// `buf` may contain a complete frame
-    is_readable: bool,
-
-    /// The last read from `inner` returned EOF
-    eof: bool,
-
     /// An error was returned, so the next poll returns `None`
     has_errored: bool,
+
+    max_frame_size: usize,
+
+    decoder: FrameDecoder,
 }
 
 #[derive(Debug)]
@@ -92,7 +81,8 @@ impl<T> FramedRead<T> {
         FramedRead {
             inner,
             buf: BytesMut::with_capacity(INITIAL_READ_CAPACITY),
-            state: ReadState::default(),
+            frame_len: None,
+            has_errored: false,
             max_frame_size,
             decoder: FrameDecoder::new(max_frame_size),
         }
@@ -451,81 +441,66 @@ where
     /// Reads from `inner` until a complete frame, head included, is buffered
     /// and splits it off.
     ///
-    /// After returning an error, the next call returns `None`. After EOF, the
-    /// remaining buffered frames are returned before `None`, and a partial
-    /// frame left in the buffer is an error.
+    /// After returning an error, the next call returns `None`. At EOF, a
+    /// partial frame left in the buffer is an error.
     fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<BytesMut, Error>>> {
+        if self.has_errored {
+            self.has_errored = false;
+            return Poll::Ready(None);
+        }
+
+        let res = self.poll_next_frame_inner(cx);
+        if let Poll::Ready(Some(Err(_))) = res {
+            self.has_errored = true;
+        }
+        res
+    }
+
+    fn poll_next_frame_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<BytesMut, Error>>> {
         loop {
-            if self.state.has_errored {
-                self.state.is_readable = false;
-                self.state.has_errored = false;
-                return Poll::Ready(None);
-            }
-
-            if self.state.is_readable {
-                let res = if self.state.eof {
-                    self.split_last_frame()
-                } else {
-                    self.split_frame()
-                };
-
-                match res {
-                    Ok(Some(bytes)) => return Poll::Ready(Some(Ok(bytes))),
-                    Ok(None) if self.state.eof => {
-                        self.state.is_readable = false;
-                        return Poll::Ready(None);
-                    }
-                    Ok(None) => self.state.is_readable = false,
-                    Err(e) => {
-                        self.state.has_errored = true;
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                }
+            if let Some(bytes) = self.split_frame()? {
+                return Poll::Ready(Some(Ok(bytes)));
             }
 
             // Make sure there is room for at least one byte, so a read of 0
             // bytes means EOF.
             self.buf.reserve(1);
-            let n = match poll_read_buf(&mut self.inner, cx, &mut self.buf) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => {
-                    self.state.has_errored = true;
-                    return Poll::Ready(Some(Err(e.into())));
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-
-            if n == 0 {
-                if self.state.eof {
-                    return Poll::Ready(None);
-                }
-                self.state.eof = true;
-            } else {
-                self.state.eof = false;
+            if ready!(poll_read_buf(&mut self.inner, cx, &mut self.buf))? == 0 {
+                return if self.buf.is_empty() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "bytes remaining on stream",
+                    )
+                    .into())))
+                };
             }
-
-            self.state.is_readable = true;
         }
     }
 
     /// Splits the frame at the front of the buffer off, if it is complete.
     fn split_frame(&mut self) -> Result<Option<BytesMut>, Error> {
-        let frame_len = match self.state.frame_len {
+        let frame_len = match self.frame_len {
             Some(frame_len) => frame_len,
             None => {
                 if self.buf.len() < LENGTH_FIELD_LEN {
                     return Ok(None);
                 }
 
-                let payload_len = (&self.buf[..LENGTH_FIELD_LEN]).get_uint(LENGTH_FIELD_LEN);
-                if payload_len > self.max_frame_size as u64 {
+                let payload_len =
+                    u32::from_be_bytes([0, self.buf[0], self.buf[1], self.buf[2]]) as usize;
+                if payload_len > self.max_frame_size {
                     proto_err!(conn: "frame size {} over max {}", payload_len, self.max_frame_size);
                     return Err(Error::library_go_away(Reason::FRAME_SIZE_ERROR));
                 }
 
-                let frame_len = payload_len as usize + frame::HEADER_LEN;
+                let frame_len = payload_len + frame::HEADER_LEN;
                 self.buf.reserve(frame_len.saturating_sub(self.buf.len()));
-                self.state.frame_len = Some(frame_len);
+                self.frame_len = Some(frame_len);
                 frame_len
             }
         };
@@ -534,7 +509,7 @@ where
             return Ok(None);
         }
 
-        self.state.frame_len = None;
+        self.frame_len = None;
         let bytes = self.buf.split_to(frame_len);
 
         // Make sure there is room to read the next frame head
@@ -542,16 +517,6 @@ where
             .reserve(frame::HEADER_LEN.saturating_sub(self.buf.len()));
 
         Ok(Some(bytes))
-    }
-
-    /// Like `split_frame`, but the peer closed the connection, so bytes left
-    /// in the buffer can never become a complete frame.
-    fn split_last_frame(&mut self) -> Result<Option<BytesMut>, Error> {
-        match self.split_frame()? {
-            Some(bytes) => Ok(Some(bytes)),
-            None if self.buf.is_empty() => Ok(None),
-            None => Err(io::Error::new(io::ErrorKind::Other, "bytes remaining on stream").into()),
-        }
     }
 }
 
@@ -567,8 +532,7 @@ where
         loop {
             tracing::trace!("poll");
             let bytes = match ready!(self.poll_next_frame(cx)) {
-                Some(Ok(bytes)) => bytes,
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(res) => res?,
                 None => return Poll::Ready(None),
             };
 
@@ -589,9 +553,7 @@ fn poll_read_buf<T: AsyncRead + Unpin>(
 ) -> Poll<io::Result<usize>> {
     // `read_buf` is cancel safe, so a new future can be polled on every call
     // and dropped when it returns `Pending`.
-    let read = io.read_buf(buf);
-    tokio::pin!(read);
-    read.poll(cx)
+    std::pin::pin!(io.read_buf(buf)).poll(cx)
 }
 
 // ===== impl Continuable =====
