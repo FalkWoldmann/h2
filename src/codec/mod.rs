@@ -1,4 +1,5 @@
 mod error;
+mod frame_buf;
 mod framed_read;
 mod framed_write;
 

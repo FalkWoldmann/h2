@@ -1,3 +1,4 @@
+use super::frame_buf::FrameBuf;
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -11,7 +12,7 @@ use futures_core::Stream;
 use bytes::{Buf, BytesMut};
 
 use std::future::Future;
-use std::io;
+use std::{io, mem};
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -20,31 +21,14 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
 
-/// Initial capacity of the read buffer, and the smallest read size.
-const INITIAL_READ_CAPACITY: usize = 8 * 1024;
-
-/// Largest read size the adaptive strategy grows to.
-const MAX_READ_SIZE: usize = 64 * 1024;
-
-/// Length of the payload length field at the start of the frame header.
-const LENGTH_FIELD_LEN: usize = 3;
-
 #[derive(Debug)]
 pub struct FramedRead<T> {
     inner: T,
 
-    /// Bytes read from `inner` that have not been split into frames yet
-    buf: BytesMut,
-
-    /// Total length (head and payload) of the frame at the front of `buf`,
-    /// set once its length field has been checked against the max frame size
-    frame_len: Option<usize>,
+    buf: FrameBuf,
 
     /// An error was returned, so the next poll returns `None`
     has_errored: bool,
-
-    /// Adapts how much buffer space is offered to each read
-    read_size: ReadSize,
 
     max_frame_size: usize,
 
@@ -86,10 +70,8 @@ impl<T> FramedRead<T> {
         let max_frame_size = DEFAULT_MAX_FRAME_SIZE as usize;
         FramedRead {
             inner,
-            buf: BytesMut::with_capacity(INITIAL_READ_CAPACITY),
-            frame_len: None,
+            buf: FrameBuf::new(),
             has_errored: false,
-            read_size: ReadSize::new(),
             max_frame_size,
             decoder: FrameDecoder::new(max_frame_size),
         }
@@ -451,15 +433,12 @@ where
     /// After returning an error, the next call returns `None`. At EOF, a
     /// partial frame left in the buffer is an error.
     fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<BytesMut, Error>>> {
-        if self.has_errored {
-            self.has_errored = false;
+        if mem::take(&mut self.has_errored) {
             return Poll::Ready(None);
         }
 
         let res = self.poll_next_frame_inner(cx);
-        if let Poll::Ready(Some(Err(_))) = res {
-            self.has_errored = true;
-        }
+        self.has_errored = matches!(res, Poll::Ready(Some(Err(_))));
         res
     }
 
@@ -468,104 +447,18 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<BytesMut, Error>>> {
         loop {
-            if let Some(bytes) = self.split_frame()? {
-                return Poll::Ready(Some(Ok(bytes)));
+            if let Some(frame) = self.buf.split_frame(self.max_frame_size)? {
+                return Poll::Ready(Some(Ok(frame)));
             }
 
-            let offered = self.reserve_for_read();
-            let n = match poll_read_buf(&mut self.inner, cx, &mut self.buf) {
-                Poll::Ready(res) => res?,
-                Poll::Pending => {
-                    self.release_if_idle();
-                    return Poll::Pending;
-                }
-            };
-            self.read_size.record(offered, n);
-            if n == 0 {
-                return if self.buf.is_empty() {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Ready(Some(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "bytes remaining on stream",
-                    )
-                    .into())))
-                };
+            let inner = &mut self.inner;
+            if ready!(self.buf.read_with(|buf| poll_read_buf(inner, cx, buf)))? == 0 {
+                let remaining = !self.buf.is_empty();
+                return Poll::Ready(remaining.then(|| {
+                    Err(io::Error::new(io::ErrorKind::Other, "bytes remaining on stream").into())
+                }));
             }
         }
-    }
-
-    /// Splits the frame at the front of the buffer off, if it is complete.
-    fn split_frame(&mut self) -> Result<Option<BytesMut>, Error> {
-        let frame_len = match self.frame_len {
-            Some(frame_len) => frame_len,
-            None => {
-                if self.buf.len() < LENGTH_FIELD_LEN {
-                    return Ok(None);
-                }
-
-                let payload_len =
-                    u32::from_be_bytes([0, self.buf[0], self.buf[1], self.buf[2]]) as usize;
-                if payload_len > self.max_frame_size {
-                    proto_err!(conn: "frame size {} over max {}", payload_len, self.max_frame_size);
-                    return Err(Error::library_go_away(Reason::FRAME_SIZE_ERROR));
-                }
-
-                let frame_len = payload_len + frame::HEADER_LEN;
-                self.frame_len = Some(frame_len);
-                frame_len
-            }
-        };
-
-        if self.buf.len() < frame_len {
-            return Ok(None);
-        }
-
-        self.frame_len = None;
-        self.read_size.frame(frame_len);
-        Ok(Some(self.buf.split_to(frame_len)))
-    }
-
-    /// Frees a read buffer that grew past its initial size once nothing is
-    /// buffered, so idle connections don't keep it.
-    fn release_if_idle(&mut self) {
-        if self.buf.is_empty() && self.buf.capacity() > INITIAL_READ_CAPACITY {
-            self.buf = BytesMut::new();
-            self.read_size.reset();
-        }
-    }
-
-    /// Makes room in `buf` for the next read and returns how much there is.
-    ///
-    /// Growing copies the bytes already buffered into a new allocation
-    /// whenever frames split off earlier still share the current one. So the
-    /// buffer only grows at a frame boundary, where at most a partial length
-    /// field is buffered, or when the frame being read does not fit.
-    /// Otherwise a short read finishes the frame in place.
-    fn reserve_for_read(&mut self) -> usize {
-        let len = self.buf.len();
-        let spare = self.buf.capacity() - len;
-        let read_size = self.read_size.get();
-
-        let (needed, total) = match self.frame_len {
-            // A frame that is large next to a read gets a full read after it,
-            // so the frames that follow land in the same allocation.
-            Some(frame_len) if frame_len > read_size / 2 => {
-                (frame_len - len, frame_len + read_size)
-            }
-            Some(frame_len) => (frame_len - len, read_size),
-            // `len` is below `LENGTH_FIELD_LEN`, so below `read_size`
-            None => (read_size - len, read_size),
-        };
-
-        if spare < needed {
-            self.buf.reserve(total - len);
-        }
-
-        // `needed` is never 0, so there is always room for a byte and a read
-        // of 0 bytes means EOF.
-        debug_assert!(self.buf.capacity() > len);
-        self.buf.capacity() - len
     }
 }
 
@@ -590,75 +483,6 @@ where
                 tracing::debug!(?frame, "received");
                 return Poll::Ready(Some(Ok(frame)));
             }
-        }
-    }
-}
-
-/// Adaptive read size, modeled on hyper's HTTP/1 read strategy: it doubles
-/// when a read fills the space offered, and halves after two reads in a row
-/// that use less than half of it.
-///
-/// Unlike hyper, growth is also capped at a few times the average frame
-/// length. Large reads pay off for large frames: they avoid a read and a
-/// buffer copy per frame. For small frames, one read of the initial size
-/// already covers hundreds of frames, so a larger buffer would only cost
-/// memory.
-#[derive(Debug)]
-struct ReadSize {
-    next: usize,
-    decrease_now: bool,
-    /// Moving average of the length of recent frames, head included
-    avg_frame_len: usize,
-}
-
-impl ReadSize {
-    fn new() -> Self {
-        ReadSize {
-            next: INITIAL_READ_CAPACITY,
-            decrease_now: false,
-            avg_frame_len: 0,
-        }
-    }
-
-    fn get(&self) -> usize {
-        self.next.min(self.max())
-    }
-
-    /// Starts over from the smallest read size, keeping the frame average.
-    fn reset(&mut self) {
-        self.next = INITIAL_READ_CAPACITY;
-        self.decrease_now = false;
-    }
-
-    fn max(&self) -> usize {
-        (self.avg_frame_len * 4).clamp(INITIAL_READ_CAPACITY, MAX_READ_SIZE)
-    }
-
-    /// Records a frame of `len` bytes, weighting it 1/8 in the average.
-    fn frame(&mut self, len: usize) {
-        self.avg_frame_len = self.avg_frame_len - self.avg_frame_len / 8 + len / 8;
-    }
-
-    /// Records a read of `n` bytes into `offered` bytes of spare capacity.
-    fn record(&mut self, offered: usize, n: usize) {
-        let size = self.get();
-        // Less than `size` is offered while part of a frame is buffered, so a
-        // read that fills what it was offered counts as full too.
-        if n >= size || (n == offered && n >= size / 2) {
-            self.next = (size * 2).min(MAX_READ_SIZE);
-            self.decrease_now = false;
-        } else if offered < size {
-            // A read limited by the space offered says nothing about the size
-            // the socket could deliver.
-        } else if n < size / 2 {
-            if self.decrease_now {
-                self.next = (size / 2).max(INITIAL_READ_CAPACITY);
-                self.decrease_now = false;
-            } else {
-                self.decrease_now = true;
-            }
-        } else {
-            self.decrease_now = false;
         }
     }
 }
@@ -718,173 +542,5 @@ impl<T> From<Continuable> for Frame<T> {
                 push.into()
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::BufMut;
-    use std::sync::Arc;
-    use std::task::Wake;
-    use tokio::io::ReadBuf;
-
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    /// Serves `data` in reads of at most `chunk` bytes, then is pending.
-    struct Reader {
-        data: Vec<u8>,
-        pos: usize,
-        chunk: usize,
-        reads: usize,
-    }
-
-    impl AsyncRead for Reader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            if self.pos == self.data.len() {
-                return Poll::Pending;
-            }
-            let n = buf
-                .remaining()
-                .min(self.chunk)
-                .min(self.data.len() - self.pos);
-            let pos = self.pos;
-            buf.put_slice(&self.data[pos..pos + n]);
-            self.pos += n;
-            self.reads += 1;
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    fn framed(frames: &[(u8, usize)], chunk: usize) -> FramedRead<Reader> {
-        let mut data = Vec::new();
-        for &(kind, len) in frames {
-            data.put_uint(len as u64, 3);
-            data.put_u8(kind);
-            data.put_u8(0);
-            data.put_u32(if kind == 0 { 1 } else { 0 });
-            if kind == 8 {
-                // A WINDOW_UPDATE increment of 0 is a protocol error
-                data.put_u32(1);
-            } else {
-                data.put_bytes(0, len);
-            }
-        }
-        FramedRead::new(Reader {
-            data,
-            pos: 0,
-            chunk,
-            reads: 0,
-        })
-    }
-
-    /// Polls until the reader is pending, returning the number of frames.
-    fn read_all(framed: &mut FramedRead<Reader>) -> usize {
-        let waker = Arc::new(NoopWake).into();
-        let mut cx = Context::from_waker(&waker);
-        let mut frames = 0;
-        while let Poll::Ready(frame) = Pin::new(&mut *framed).poll_next(&mut cx) {
-            frame.expect("stream ended").expect("decode error");
-            frames += 1;
-        }
-        frames
-    }
-
-    const DATA_16K: (u8, usize) = (0, 16_384);
-    const WINDOW_UPDATE: (u8, usize) = (8, 4);
-
-    #[test]
-    fn large_frames_take_few_reads() {
-        let mut framed = framed(&[DATA_16K; 64], usize::MAX);
-        assert_eq!(read_all(&mut framed), 64);
-        // A fixed 8 KiB buffer takes two reads for each of these frames.
-        // Allow at most one read per two frames, ramp-up included.
-        assert!(
-            framed.inner.reads <= 32,
-            "{} reads for 64 frames",
-            framed.inner.reads
-        );
-    }
-
-    #[test]
-    fn small_frames_keep_initial_read_size() {
-        let mut framed = framed(&[WINDOW_UPDATE; 4096], usize::MAX);
-        assert_eq!(read_all(&mut framed), 4096);
-        assert_eq!(framed.read_size.get(), INITIAL_READ_CAPACITY);
-        // Nothing grew, so the buffer is kept while idle.
-        assert!(framed.buf.capacity() > 0);
-        assert!(framed.buf.capacity() <= INITIAL_READ_CAPACITY);
-    }
-
-    #[test]
-    fn grown_buffer_is_released_when_idle() {
-        let mut framed = framed(&[DATA_16K; 16], usize::MAX);
-        assert_eq!(read_all(&mut framed), 16);
-        assert_eq!(framed.buf.capacity(), 0);
-        assert_eq!(framed.read_size.get(), INITIAL_READ_CAPACITY);
-    }
-
-    #[test]
-    fn partial_frame_is_kept_when_idle() {
-        let mut framed = framed(&[DATA_16K; 2], usize::MAX);
-        framed.inner.data.truncate(16_393 + 100);
-        assert_eq!(read_all(&mut framed), 1);
-        assert_eq!(framed.buf.len(), 100);
-    }
-
-    #[test]
-    fn frame_split_across_small_reads() {
-        let mut framed = framed(&[DATA_16K, WINDOW_UPDATE, DATA_16K], 1_000);
-        assert_eq!(read_all(&mut framed), 3);
-    }
-
-    #[test]
-    fn read_size_policy() {
-        let mut size = ReadSize::new();
-        for _ in 0..64 {
-            size.frame(16_393);
-        }
-
-        // Doubles on full reads, up to the max
-        let mut steps = vec![size.get()];
-        for _ in 0..4 {
-            let next = size.get();
-            size.record(next, next);
-            steps.push(size.get());
-        }
-        assert_eq!(steps, [8 << 10, 16 << 10, 32 << 10, 64 << 10, 64 << 10]);
-
-        // A read limited by the space offered is ignored
-        size.record(100, 50);
-        assert_eq!(size.get(), 64 << 10);
-
-        // Halves after two small reads in a row
-        size.record(64 << 10, 1_000);
-        assert_eq!(size.get(), 64 << 10);
-        size.record(64 << 10, 1_000);
-        assert_eq!(size.get(), 32 << 10);
-
-        // A read in range cancels a pending decrease
-        size.record(32 << 10, 1_000);
-        size.record(32 << 10, 20 << 10);
-        size.record(32 << 10, 1_000);
-        assert_eq!(size.get(), 32 << 10);
-
-        // Small frames cap the size again
-        for _ in 0..64 {
-            size.frame(13);
-        }
-        assert_eq!(size.get(), INITIAL_READ_CAPACITY);
-
-        size.reset();
-        assert_eq!(size.get(), INITIAL_READ_CAPACITY);
     }
 }
