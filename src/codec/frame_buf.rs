@@ -19,7 +19,7 @@ const LENGTH_FIELD_LEN: usize = 3;
 ///
 /// It decides how much room each read gets, but does no I/O itself:
 /// [`FrameBuf::read_with`] takes the read to perform.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct FrameBuf {
     buf: BytesMut,
 
@@ -31,14 +31,6 @@ pub(super) struct FrameBuf {
 }
 
 impl FrameBuf {
-    pub(super) fn new() -> Self {
-        FrameBuf {
-            buf: BytesMut::with_capacity(INITIAL_READ_SIZE),
-            frame_len: None,
-            read_size: ReadSize::default(),
-        }
-    }
-
     pub(super) fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
@@ -46,30 +38,39 @@ impl FrameBuf {
     /// Splits the frame at the front off, head included, if it is complete.
     #[inline]
     pub(super) fn split_frame(&mut self, max_frame_size: usize) -> Result<Option<BytesMut>, Error> {
-        let frame_len = match self.frame_len {
+        let frame_len = match self.frame_len.take() {
             Some(frame_len) => frame_len,
-            None => {
-                let (a, b, c) = match self.buf.get(..LENGTH_FIELD_LEN) {
-                    Some(&[a, b, c]) => (a, b, c),
-                    _ => return Ok(None),
-                };
-
-                let payload_len = u32::from_be_bytes([0, a, b, c]) as usize;
-                if payload_len > max_frame_size {
-                    return Err(frame_too_large(payload_len, max_frame_size));
-                }
-
-                *self.frame_len.insert(payload_len + frame::HEADER_LEN)
-            }
+            None => match self.peek_frame_len(max_frame_size)? {
+                Some(frame_len) => frame_len,
+                None => return Ok(None),
+            },
         };
 
         if self.buf.len() < frame_len {
+            // Keep the checked length until the rest of the frame arrives
+            self.frame_len = Some(frame_len);
             return Ok(None);
         }
 
-        self.frame_len = None;
         self.read_size.record_frame(frame_len);
         Ok(Some(self.buf.split_to(frame_len)))
+    }
+
+    /// Reads the length of the frame at the front from its head, once the
+    /// length field is buffered, and checks it against the max frame size.
+    #[inline]
+    fn peek_frame_len(&self, max_frame_size: usize) -> Result<Option<usize>, Error> {
+        let (a, b, c) = match self.buf.get(..LENGTH_FIELD_LEN) {
+            Some(&[a, b, c]) => (a, b, c),
+            _ => return Ok(None),
+        };
+
+        let payload_len = u32::from_be_bytes([0, a, b, c]) as usize;
+        if payload_len > max_frame_size {
+            return Err(frame_too_large(payload_len, max_frame_size));
+        }
+
+        Ok(Some(payload_len + frame::HEADER_LEN))
     }
 
     /// Makes room for a read, lets `read` append to the buffer, and adapts
@@ -139,6 +140,9 @@ impl FrameBuf {
     }
 }
 
+/// Kept out of line so that `split_frame` stays small enough to inline.
+/// Marking the branch with `std::hint::cold_path` instead does not achieve
+/// that.
 #[cold]
 fn frame_too_large(payload_len: usize, max_frame_size: usize) -> Error {
     proto_err!(conn: "frame size {} over max {}", payload_len, max_frame_size);
@@ -263,7 +267,7 @@ mod tests {
 
     #[test]
     fn large_frames_take_few_reads() {
-        let mut buf = FrameBuf::new();
+        let mut buf = FrameBuf::default();
         let (frames, reads) = feed(&mut buf, &frames(&[16_384; 64]), usize::MAX);
         assert_eq!(frames, 64);
         // A fixed 8 KiB buffer takes two reads for each of these frames.
@@ -273,7 +277,7 @@ mod tests {
 
     #[test]
     fn small_frames_keep_initial_read_size() {
-        let mut buf = FrameBuf::new();
+        let mut buf = FrameBuf::default();
         assert_eq!(feed(&mut buf, &frames(&[4; 4096]), usize::MAX).0, 4096);
         assert_eq!(buf.read_size.get(), INITIAL_READ_SIZE);
         // Nothing grew, so the buffer is kept while idle.
@@ -282,7 +286,7 @@ mod tests {
 
     #[test]
     fn grown_buffer_is_released_when_idle() {
-        let mut buf = FrameBuf::new();
+        let mut buf = FrameBuf::default();
         assert_eq!(feed(&mut buf, &frames(&[16_384; 16]), usize::MAX).0, 16);
         assert_eq!(buf.buf.capacity(), 0);
         assert_eq!(buf.read_size.get(), INITIAL_READ_SIZE);
@@ -290,7 +294,7 @@ mod tests {
 
     #[test]
     fn partial_frame_is_kept_when_idle() {
-        let mut buf = FrameBuf::new();
+        let mut buf = FrameBuf::default();
         let data = frames(&[16_384; 2]);
         let partial = frame::HEADER_LEN + 16_384 + 100;
         assert_eq!(feed(&mut buf, &data[..partial], usize::MAX).0, 1);
@@ -299,14 +303,14 @@ mod tests {
 
     #[test]
     fn frame_split_across_small_reads() {
-        let mut buf = FrameBuf::new();
+        let mut buf = FrameBuf::default();
         let data = frames(&[16_384, 4, 16_384]);
         assert_eq!(feed(&mut buf, &data, 1_000).0, 3);
     }
 
     #[test]
     fn frame_over_max_size_is_rejected() {
-        let mut buf = FrameBuf::new();
+        let mut buf = FrameBuf::default();
         buf.buf.extend_from_slice(&[0, 64, 1]);
         assert!(buf.split_frame(MAX_FRAME_SIZE).is_err());
     }
