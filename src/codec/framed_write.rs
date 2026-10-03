@@ -401,3 +401,187 @@ mod unstable {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::task::Wake;
+
+    /// A buffer made of separate chunks, so it can need more slices than a
+    /// vectored write takes. Like any `Buf`, it has no empty chunks.
+    struct Chunks(VecDeque<Bytes>);
+
+    impl Chunks {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Chunks(
+                chunks
+                    .into_iter()
+                    .filter(|chunk| !chunk.is_empty())
+                    .map(Bytes::from)
+                    .collect(),
+            )
+        }
+    }
+
+    impl Buf for Chunks {
+        fn remaining(&self) -> usize {
+            self.0.iter().map(Bytes::len).sum()
+        }
+
+        fn chunk(&self) -> &[u8] {
+            self.0.front().map_or(&[], |chunk| chunk)
+        }
+
+        fn advance(&mut self, mut cnt: usize) {
+            while cnt > 0 {
+                let front = self.0.front_mut().expect("advanced past the end");
+                let n = cnt.min(front.len());
+                front.advance(n);
+                cnt -= n;
+                if front.is_empty() {
+                    self.0.pop_front();
+                }
+            }
+        }
+
+        fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+            let mut n = 0;
+            for (slot, chunk) in dst.iter_mut().zip(&self.0) {
+                *slot = IoSlice::new(chunk);
+                n += 1;
+            }
+            n
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        /// Accept at most this many bytes
+        Write(usize),
+        Pending,
+    }
+
+    /// Accepts writes according to its plan, cycled.
+    struct Writer {
+        written: Vec<u8>,
+        ops: Vec<Op>,
+        next: usize,
+        vectored: bool,
+    }
+
+    impl Writer {
+        fn next_op(&mut self) -> Op {
+            let op = self.ops[self.next % self.ops.len()];
+            self.next += 1;
+            op
+        }
+    }
+
+    impl AsyncWrite for Writer {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.next_op() {
+                Op::Pending => Poll::Pending,
+                Op::Write(max) => {
+                    let n = buf.len().min(max);
+                    self.written.extend_from_slice(&buf[..n]);
+                    Poll::Ready(Ok(n))
+                }
+            }
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            assert!(self.vectored, "vectored write to a writer without support");
+            assert!(bufs.len() <= 64, "{} slices", bufs.len());
+            match self.next_op() {
+                Op::Pending => Poll::Pending,
+                Op::Write(mut max) => {
+                    let mut n = 0;
+                    for buf in bufs {
+                        let take = buf.len().min(max);
+                        self.written.extend_from_slice(&buf[..take]);
+                        n += take;
+                        max -= take;
+                    }
+                    Poll::Ready(Ok(n))
+                }
+            }
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.vectored
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        let write = prop_oneof![1usize..=8, 1usize..=100_000].prop_map(Op::Write);
+        (
+            write.clone(),
+            vec(prop_oneof![4 => write, 1 => Just(Op::Pending)], 0..8),
+        )
+            .prop_map(|(first, mut rest)| {
+                rest.insert(0, first);
+                rest
+            })
+    }
+
+    proptest! {
+        /// Whatever the writer accepts at a time, and whether or not it
+        /// supports vectored writes, every byte is written once, in order,
+        /// and the buffer advances by exactly what each write reports.
+        #[test]
+        fn poll_write_buf_writes_everything_in_order(
+            chunks in vec(vec(any::<u8>(), 0..300), 0..100),
+            ops in ops(),
+            vectored in any::<bool>(),
+        ) {
+            let expected = chunks.concat();
+            let mut buf = Chunks::new(chunks);
+            let mut writer = Writer { written: Vec::new(), ops, next: 0, vectored };
+            let waker = Arc::new(NoopWake).into();
+            let mut cx = Context::from_waker(&waker);
+
+            while buf.has_remaining() {
+                let before = buf.remaining();
+                match poll_write_buf(Pin::new(&mut writer), &mut cx, &mut buf) {
+                    Poll::Ready(Ok(n)) => {
+                        prop_assert!(n > 0);
+                        prop_assert_eq!(before - buf.remaining(), n);
+                    }
+                    Poll::Ready(Err(e)) => return Err(TestCaseError::fail(e.to_string())),
+                    Poll::Pending => {}
+                }
+            }
+
+            prop_assert_eq!(&writer.written, &expected);
+            let empty = poll_write_buf(Pin::new(&mut writer), &mut cx, &mut buf);
+            prop_assert!(matches!(empty, Poll::Ready(Ok(0))));
+        }
+    }
+}
