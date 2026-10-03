@@ -124,7 +124,7 @@ use bytes::{Buf, Bytes};
 use http::{HeaderMap, Method, Request, Response};
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
