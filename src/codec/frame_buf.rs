@@ -375,4 +375,221 @@ mod tests {
         size.reset();
         assert_eq!(size.get(), INITIAL_READ_SIZE);
     }
+
+    mod properties {
+        use super::*;
+        use bytes::BufMut;
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+        use std::ops::Range;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Op {
+            /// A read of at most this many bytes
+            Read(usize),
+            Pending,
+        }
+
+        fn read() -> impl Strategy<Value = Op> {
+            prop_oneof![1usize..=16, 1usize..=4_096, 1usize..=100_000].prop_map(Op::Read)
+        }
+
+        /// Read plans, cycled while there is data left. Each starts with a
+        /// read, so a plan always makes progress.
+        fn ops() -> impl Strategy<Value = Vec<Op>> {
+            (
+                read(),
+                vec(prop_oneof![4 => read(), 1 => Just(Op::Pending)], 0..16),
+            )
+                .prop_map(|(first, mut rest)| {
+                    rest.insert(0, first);
+                    rest
+                })
+        }
+
+        /// Payload lengths: mostly small, sometimes up to `max`, and `max`
+        /// itself.
+        fn payload_lens(max: usize) -> impl Strategy<Value = Vec<usize>> {
+            let len = prop_oneof![4 => 0..64usize, 3 => 0..4_096.min(max + 1), 1 => 0..=max, 1 => Just(max)];
+            vec(len, 0..24)
+        }
+
+        /// Encodes frames with distinct contents, returning where each one is.
+        fn encode(payload_lens: &[usize]) -> (Vec<u8>, Vec<Range<usize>>) {
+            let mut data = Vec::new();
+            let mut frames = Vec::new();
+            for (i, &len) in payload_lens.iter().enumerate() {
+                let start = data.len();
+                data.put_uint(len as u64, LENGTH_FIELD_LEN);
+                data.put_u8(i as u8);
+                data.put_u8(0);
+                data.put_u32(i as u32);
+                data.extend((0..len).map(|j| (i * 31 + j) as u8));
+                frames.push(start..data.len());
+            }
+            (data, frames)
+        }
+
+        /// Reads `data` through `buf`, performing the ops of the plan in turn,
+        /// and checks the room offered to each read.
+        ///
+        /// Returns the frames split off, and the error that ended the stream,
+        /// if any.
+        fn drive(
+            buf: &mut FrameBuf,
+            mut data: &[u8],
+            ops: &[Op],
+            max_frame_size: usize,
+        ) -> (Vec<BytesMut>, Result<(), Error>) {
+            // Growth requests at most a frame and a read. The allocator may
+            // round that up to twice as much.
+            let capacity_bound = 2 * (max_frame_size + frame::HEADER_LEN + MAX_READ_SIZE);
+            let mut ops = ops.iter().cycle();
+            let mut read = |buf: &mut BytesMut| {
+                let spare = buf.capacity() - buf.len();
+                assert!(spare > 0, "a read must have room for a byte");
+                assert!(
+                    buf.capacity() <= capacity_bound,
+                    "capacity {}",
+                    buf.capacity()
+                );
+                // At a frame boundary there is room for a full read, and
+                // otherwise for the frame at the front, going by its length
+                // field.
+                if buf.len() < LENGTH_FIELD_LEN {
+                    assert!(
+                        buf.capacity() >= INITIAL_READ_SIZE,
+                        "{} bytes at a boundary",
+                        buf.capacity()
+                    );
+                } else if let Some(&[a, b, c]) = buf.get(..LENGTH_FIELD_LEN) {
+                    let frame_len = u32::from_be_bytes([0, a, b, c]) as usize + frame::HEADER_LEN;
+                    assert!(
+                        buf.capacity() >= frame_len,
+                        "{} bytes for a {} byte frame",
+                        buf.capacity(),
+                        frame_len
+                    );
+                }
+
+                match ops.next() {
+                    Some(Op::Pending) => Poll::Pending,
+                    Some(&Op::Read(max)) => {
+                        let n = spare.min(max).min(data.len());
+                        buf.extend_from_slice(&data[..n]);
+                        data = &data[n..];
+                        Poll::Ready(Ok(n))
+                    }
+                    None => unreachable!("plans are never empty"),
+                }
+            };
+
+            let mut frames = Vec::new();
+            loop {
+                match buf.poll_frame(max_frame_size, &mut read) {
+                    Poll::Ready(Some(Ok(frame))) => frames.push(frame),
+                    Poll::Ready(Some(Err(e))) => return (frames, Err(e)),
+                    Poll::Ready(None) => return (frames, Ok(())),
+                    Poll::Pending => {}
+                }
+            }
+        }
+
+        proptest! {
+            /// However the stream is cut into reads, the frames come out
+            /// whole, in order and unchanged, even while earlier frames
+            /// still share the buffer.
+            #[test]
+            fn frames_survive_any_read_pattern(
+                (max_frame_size, lens) in prop_oneof![Just(MAX_FRAME_SIZE), 16_384usize..=200_000]
+                    .prop_flat_map(|max| (Just(max), payload_lens(max))),
+                ops in ops(),
+            ) {
+                let (data, expected) = encode(&lens);
+                let mut buf = FrameBuf::default();
+
+                let (frames, res) = drive(&mut buf, &data, &ops, max_frame_size);
+
+                prop_assert!(res.is_ok(), "{:?}", res);
+                prop_assert_eq!(frames.len(), expected.len());
+                for (frame, range) in frames.iter().zip(expected) {
+                    prop_assert_eq!(&frame[..], &data[range]);
+                }
+            }
+
+            /// EOF is an error exactly when the stream ended inside a frame.
+            #[test]
+            fn truncated_stream_fails_inside_a_frame(
+                lens in payload_lens(MAX_FRAME_SIZE),
+                cut in any::<prop::sample::Index>(),
+                ops in ops(),
+            ) {
+                let (data, expected) = encode(&lens);
+                let cut = cut.index(data.len() + 1);
+                let mut buf = FrameBuf::default();
+
+                let (frames, res) = drive(&mut buf, &data[..cut], &ops, MAX_FRAME_SIZE);
+
+                let complete = expected.iter().filter(|range| range.end <= cut).count();
+                prop_assert_eq!(frames.len(), complete);
+                let at_boundary = cut == 0 || expected.iter().any(|range| range.end == cut);
+                prop_assert_eq!(res.is_ok(), at_boundary, "{:?}", res);
+            }
+
+            /// A frame over the max size is rejected once its length field is
+            /// buffered, and the frames before it come out intact.
+            #[test]
+            fn oversized_frame_is_rejected_in_place(
+                lens in payload_lens(1_000),
+                excess in 1usize..=100_000,
+                ops in ops(),
+            ) {
+                let max_frame_size = 1_000;
+                let lens: Vec<usize> = lens.into_iter().map(|len| len.min(max_frame_size)).collect();
+                let (mut data, expected) = encode(&lens);
+                data.put_uint((max_frame_size + excess) as u64, LENGTH_FIELD_LEN);
+                let mut buf = FrameBuf::default();
+
+                let (frames, res) = drive(&mut buf, &data, &ops, max_frame_size);
+
+                prop_assert!(
+                    matches!(res, Err(Error::GoAway(_, Reason::FRAME_SIZE_ERROR, _))),
+                    "{:?}",
+                    res
+                );
+                prop_assert_eq!(frames.len(), expected.len());
+                for (frame, range) in frames.iter().zip(expected) {
+                    prop_assert_eq!(&frame[..], &data[range]);
+                }
+            }
+
+            /// The read size stays within its bounds, and the frame average
+            /// never exceeds the largest frame seen.
+            #[test]
+            fn read_size_stays_in_bounds(
+                events in vec(prop_oneof![
+                    (frame::HEADER_LEN..=frame::HEADER_LEN + (1 << 24)).prop_map(Ok),
+                    (1usize..=1 << 20, any::<prop::sample::Index>())
+                        .prop_map(|(offered, n)| Err(Some((offered, n.index(offered + 1))))),
+                    Just(Err(None)),
+                ], 0..200),
+            ) {
+                let mut size = ReadSize::default();
+                let mut largest_frame = 0;
+                for event in events {
+                    match event {
+                        Ok(len) => {
+                            largest_frame = largest_frame.max(len);
+                            size.record_frame(len);
+                        }
+                        Err(Some((offered, n))) => size.record_read(offered, n),
+                        Err(None) => size.reset(),
+                    }
+                    prop_assert!((INITIAL_READ_SIZE..=MAX_READ_SIZE).contains(&size.get()));
+                    prop_assert!((INITIAL_READ_SIZE..=MAX_READ_SIZE).contains(&size.next));
+                    prop_assert!(size.avg_frame_len <= largest_frame);
+                }
+            }
+        }
+    }
 }
