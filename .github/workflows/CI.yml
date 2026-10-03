@@ -98,27 +98,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve MSRV aware dependencies
+        run: cargo update
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+
       - name: Get MSRV from package metadata
         id: msrv
         run: grep rust-version Cargo.toml | cut -d '"' -f2 | sed 's/^/version=/' >> $GITHUB_OUTPUT
 
-      - name: Install Rust (${{ steps.metadata.outputs.msrv }})
-        id: msrv-toolchain
+      - name: Install Rust (${{ steps.msrv.outputs.version }})
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-
-      - name: Pin some dependencies for MSRV
-        run: |
-          cargo update --package tokio --precise 1.38.1
-          cargo update --package indexmap --precise 2.11.3
-          cargo update --package hashbrown --precise 0.15.0
-          cargo update --package once_cell --precise 1.20.3
-          cargo update --package tracing --precise 0.1.41
-          cargo update --package tracing-subscriber --precise 0.3.19
-          cargo update --package tracing-core --precise 0.1.33
-          cargo update --package itoa --precise 1.0.15
-
 
       - run: cargo check -p h2
 

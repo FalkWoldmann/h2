@@ -17,7 +17,7 @@ keywords = ["http", "async", "non-blocking"]
 categories = ["asynchronous", "web-programming", "network-programming"]
 exclude = ["fixtures/**", "ci/**"]
 edition = "2021"
-rust-version = "1.68"
+rust-version = "1.71"
 
 [features]
 # Enables `futures::Stream` implementations for various types.
