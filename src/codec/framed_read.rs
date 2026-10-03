@@ -70,7 +70,7 @@ impl<T> FramedRead<T> {
         let max_frame_size = DEFAULT_MAX_FRAME_SIZE as usize;
         FramedRead {
             inner,
-            buf: FrameBuf::new(),
+            buf: FrameBuf::default(),
             has_errored: false,
             max_frame_size,
             decoder: FrameDecoder::new(max_frame_size),
@@ -451,8 +451,8 @@ where
                 return Poll::Ready(Some(Ok(frame)));
             }
 
-            let inner = &mut self.inner;
-            if ready!(self.buf.read_with(|buf| poll_read_buf(inner, cx, buf)))? == 0 {
+            let read = |buf: &mut BytesMut| poll_read_buf(&mut self.inner, cx, buf);
+            if ready!(self.buf.read_with(read))? == 0 {
                 let remaining = !self.buf.is_empty();
                 return Poll::Ready(remaining.then(|| {
                     Err(io::Error::new(io::ErrorKind::Other, "bytes remaining on stream").into())
