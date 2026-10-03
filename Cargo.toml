@@ -55,6 +55,7 @@ indexmap = { version = "2", features = ["std"] }
 # Fuzzing
 quickcheck = { version = "1.0.3", default-features = false }
 rand = "0.8.4"
+proptest = { version = "1.4", default-features = false, features = ["std"] }
 
 # HPACK fixtures
 hex = "0.4.3"
