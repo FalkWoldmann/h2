@@ -242,6 +242,110 @@ impl ReadSize {
     }
 }
 
+/// Proofs, checked with [Kani](https://model-checking.github.io/kani/) by
+/// running `cargo kani --lib`, that the read sizing arithmetic holds for all
+/// inputs.
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use crate::frame::MAX_MAX_FRAME_SIZE;
+
+    /// Longest frame, head included, that any max frame size setting allows
+    const MAX_FRAME_LEN: usize = MAX_MAX_FRAME_SIZE as usize + frame::HEADER_LEN;
+
+    fn is_reachable(size: &ReadSize) -> bool {
+        (INITIAL_READ_SIZE..=MAX_READ_SIZE).contains(&size.next)
+            && size.avg_frame_len <= MAX_FRAME_LEN
+    }
+
+    /// Any `ReadSize` in a state its methods can reach from the default one.
+    fn any_reachable() -> ReadSize {
+        let size = ReadSize {
+            next: kani::any(),
+            decrease_now: kani::any(),
+            avg_frame_len: kani::any(),
+        };
+        kani::assume(is_reachable(&size));
+        size
+    }
+
+    // By induction, these four cover every sequence of calls.
+
+    #[kani::proof]
+    fn default_is_reachable() {
+        assert!(is_reachable(&ReadSize::default()));
+    }
+
+    #[kani::proof]
+    fn record_frame_stays_reachable() {
+        let mut size = any_reachable();
+        let before = size.avg_frame_len;
+        // `split_frame` only records frames within the max frame size
+        let len = kani::any();
+        kani::assume((frame::HEADER_LEN..=MAX_FRAME_LEN).contains(&len));
+
+        size.record_frame(len);
+
+        assert!(is_reachable(&size));
+        assert!(size.avg_frame_len <= before.max(len));
+    }
+
+    #[kani::proof]
+    fn record_read_stays_reachable() {
+        let mut size = any_reachable();
+        // A read can't fill more than the room it was offered
+        let (offered, n): (usize, usize) = kani::any();
+        kani::assume(n <= offered);
+
+        let before = size.get();
+        size.record_read(offered, n);
+
+        assert!(is_reachable(&size));
+        kani::cover!(size.get() > before, "grows");
+        kani::cover!(size.get() < before, "shrinks");
+    }
+
+    #[kani::proof]
+    fn reset_stays_reachable() {
+        let mut size = any_reachable();
+        size.reset();
+        assert!(is_reachable(&size));
+    }
+
+    #[kani::proof]
+    fn read_size_is_in_bounds() {
+        let size = any_reachable();
+        assert!((INITIAL_READ_SIZE..=MAX_READ_SIZE).contains(&size.get()));
+    }
+
+    /// Given what `read_with` guarantees, the room a read needs is never 0,
+    /// growing to the capacity makes that room, and the capacity is bounded.
+    #[kani::proof]
+    fn read_room_is_sound() {
+        let len = kani::any();
+        let frame_len: Option<usize> = kani::any();
+        let read_size = kani::any();
+        kani::assume((INITIAL_READ_SIZE..=MAX_READ_SIZE).contains(&read_size));
+        match frame_len {
+            Some(frame_len) => kani::assume(len < frame_len && frame_len <= MAX_FRAME_LEN),
+            None => kani::assume(len < LENGTH_FIELD_LEN),
+        }
+
+        let (needed, capacity) = read_room(len, frame_len, read_size);
+        kani::cover!(frame_len.is_none(), "at a frame boundary");
+        kani::cover!(capacity > read_size, "a large frame");
+        kani::cover!(
+            frame_len.is_some() && capacity == read_size,
+            "a small frame"
+        );
+
+        assert!(needed > 0);
+        assert!(capacity >= len + needed);
+        assert!(capacity >= INITIAL_READ_SIZE);
+        assert!(capacity <= MAX_FRAME_LEN + MAX_READ_SIZE);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
