@@ -8,7 +8,7 @@ use http::HeaderMap;
 use std::fmt;
 #[cfg(feature = "stream")]
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 /// Sends the body stream and trailers to the remote peer.
 ///
