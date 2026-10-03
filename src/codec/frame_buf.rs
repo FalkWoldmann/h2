@@ -4,7 +4,7 @@ use crate::proto::Error;
 use bytes::BytesMut;
 
 use std::io;
-use std::task::Poll;
+use std::task::{ready, Poll};
 
 /// Initial capacity of the read buffer, and the smallest read size.
 const INITIAL_READ_SIZE: usize = 8 * 1024;
@@ -18,26 +18,47 @@ const LENGTH_FIELD_LEN: usize = 3;
 /// Bytes read from the connection that have not been split into frames yet.
 ///
 /// It decides how much room each read gets, but does no I/O itself:
-/// [`FrameBuf::read_with`] takes the read to perform.
+/// [`FrameBuf::poll_frame`] takes the read to perform.
 #[derive(Debug, Default)]
 pub(super) struct FrameBuf {
     buf: BytesMut,
 
     /// Total length (head and payload) of the frame at the front of `buf`,
     /// set once its length field has been checked against the max frame size
+    /// and kept while the frame is incomplete
     frame_len: Option<usize>,
 
     read_size: ReadSize,
 }
 
 impl FrameBuf {
-    pub(super) fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+    /// Splits the next frame off, head included, reading with `read` until
+    /// one is complete.
+    ///
+    /// `read` appends to the buffer it is given and returns how many bytes it
+    /// read, 0 meaning EOF. At EOF, a partial frame left in the buffer is an
+    /// error.
+    #[inline]
+    pub(super) fn poll_frame(
+        &mut self,
+        max_frame_size: usize,
+        mut read: impl FnMut(&mut BytesMut) -> Poll<io::Result<usize>>,
+    ) -> Poll<Option<Result<BytesMut, Error>>> {
+        loop {
+            if let Some(frame) = self.split_frame(max_frame_size)? {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+
+            if ready!(self.read_with(&mut read))? == 0 {
+                let remaining = !self.buf.is_empty();
+                return Poll::Ready(remaining.then(|| Err(bytes_remaining())));
+            }
+        }
     }
 
     /// Splits the frame at the front off, head included, if it is complete.
     #[inline]
-    pub(super) fn split_frame(&mut self, max_frame_size: usize) -> Result<Option<BytesMut>, Error> {
+    fn split_frame(&mut self, max_frame_size: usize) -> Result<Option<BytesMut>, Error> {
         let frame_len = match self.frame_len.take() {
             Some(frame_len) => frame_len,
             None => match self.peek_frame_len(max_frame_size)? {
@@ -47,7 +68,6 @@ impl FrameBuf {
         };
 
         if self.buf.len() < frame_len {
-            // Keep the checked length until the rest of the frame arrives
             self.frame_len = Some(frame_len);
             return Ok(None);
         }
@@ -75,14 +95,23 @@ impl FrameBuf {
     /// Makes room for a read, lets `read` append to the buffer, and adapts
     /// the next read size to how much it read.
     ///
+    /// Only called once `split_frame` found no complete frame, which is what
+    /// `read_room` relies on.
+    ///
     /// When `read` is pending with nothing buffered, a buffer that grew past
     /// its initial size is freed, so idle connections don't keep it.
     #[inline]
-    pub(super) fn read_with(
+    fn read_with(
         &mut self,
         read: impl FnOnce(&mut BytesMut) -> Poll<io::Result<usize>>,
     ) -> Poll<io::Result<usize>> {
-        let offered = self.reserve();
+        let len = self.buf.len();
+        let (needed, capacity) = read_room(len, self.frame_len, self.read_size.get());
+        if self.spare() < needed {
+            self.buf.reserve(capacity - len);
+        }
+
+        let offered = self.spare();
         let res = read(&mut self.buf);
         match res {
             Poll::Ready(Ok(n)) => self.read_size.record_read(offered, n),
@@ -90,41 +119,6 @@ impl FrameBuf {
             Poll::Pending => self.release_if_idle(),
         }
         res
-    }
-
-    /// Makes room in the buffer for the next read and returns how much there
-    /// is.
-    ///
-    /// Growing copies the bytes already buffered into a new allocation
-    /// whenever frames split off earlier still share the current one. So the
-    /// buffer only grows at a frame boundary, where at most a partial length
-    /// field is buffered, or when the frame being read does not fit.
-    /// Otherwise a short read finishes the frame in place.
-    fn reserve(&mut self) -> usize {
-        let len = self.buf.len();
-        let read_size = self.read_size.get();
-
-        // The room the next read needs, and the capacity to grow to if the
-        // buffer has less.
-        let (needed, capacity) = match self.frame_len {
-            // A frame that is large next to a read gets a full read after it,
-            // so the frames that follow land in the same allocation.
-            Some(frame_len) if frame_len > read_size / 2 => {
-                (frame_len - len, frame_len + read_size)
-            }
-            Some(frame_len) => (frame_len - len, read_size),
-            // `len` is below `LENGTH_FIELD_LEN`, so below `read_size`
-            None => (read_size - len, read_size),
-        };
-
-        if self.spare() < needed {
-            self.buf.reserve(capacity - len);
-        }
-
-        // `needed` is never 0, so there is always room for a byte and a read
-        // of 0 bytes means EOF.
-        debug_assert!(self.spare() > 0);
-        self.spare()
     }
 
     fn spare(&self) -> usize {
@@ -139,13 +133,42 @@ impl FrameBuf {
     }
 }
 
-/// Kept out of line so that `split_frame` stays small enough to inline.
-/// Marking the branch with `std::hint::cold_path` instead does not achieve
-/// that.
+/// Returns the room the next read needs with `len` bytes buffered, and the
+/// capacity to grow to if the buffer has less.
+///
+/// `frame_len` is the length of the frame at the front if its length field is
+/// buffered, and then exceeds `len`. Otherwise `len` is below
+/// `LENGTH_FIELD_LEN`.
+///
+/// Growing copies the bytes already buffered into a new allocation whenever
+/// frames split off earlier still share the current one. So the buffer only
+/// grows at a frame boundary, where at most a partial length field is
+/// buffered, or when the frame being read does not fit. Otherwise a short read
+/// finishes the frame in place.
+#[inline]
+fn read_room(len: usize, frame_len: Option<usize>, read_size: usize) -> (usize, usize) {
+    match frame_len {
+        // A frame that is large next to a read gets a full read after it, so
+        // the frames that follow land in the same allocation.
+        Some(frame_len) if frame_len > read_size / 2 => (frame_len - len, frame_len + read_size),
+        Some(frame_len) => (frame_len - len, read_size),
+        None => (read_size - len, read_size),
+    }
+}
+
+// Errors are built out of line so that `poll_frame` stays small enough to
+// inline. Marking the branches with `std::hint::cold_path` instead does not
+// achieve that.
+
 #[cold]
 fn frame_too_large(payload_len: usize, max_frame_size: usize) -> Error {
     proto_err!(conn: "frame size {} over max {}", payload_len, max_frame_size);
     Error::library_go_away(Reason::FRAME_SIZE_ERROR)
+}
+
+#[cold]
+fn bytes_remaining() -> Error {
+    io::Error::new(io::ErrorKind::Other, "bytes remaining on stream").into()
 }
 
 /// Adaptive read size, modeled on hyper's HTTP/1 read strategy: it doubles
@@ -236,32 +259,28 @@ mod tests {
         data
     }
 
-    /// Feeds `data` through `buf` in reads of at most `chunk` bytes, the way
-    /// `FramedRead` does, until a read is pending.
+    /// Feeds `data` through `buf` in reads of at most `chunk` bytes, until a
+    /// read is pending.
     ///
     /// Returns the number of frames split off and of reads.
     fn feed(buf: &mut FrameBuf, mut data: &[u8], chunk: usize) -> (usize, usize) {
         let (mut frames, mut reads) = (0, 0);
-        loop {
-            while buf.split_frame(MAX_FRAME_SIZE).unwrap().is_some() {
-                frames += 1;
+        let mut read = |buf: &mut BytesMut| {
+            if data.is_empty() {
+                return Poll::Pending;
             }
-
-            let res = buf.read_with(|buf| {
-                if data.is_empty() {
-                    return Poll::Pending;
-                }
-                let n = (buf.capacity() - buf.len()).min(chunk).min(data.len());
-                buf.extend_from_slice(&data[..n]);
-                data = &data[n..];
-                Poll::Ready(Ok(n))
-            });
-
-            if res.is_pending() {
-                return (frames, reads);
-            }
+            let n = (buf.capacity() - buf.len()).min(chunk).min(data.len());
+            buf.extend_from_slice(&data[..n]);
+            data = &data[n..];
             reads += 1;
+            Poll::Ready(Ok(n))
+        };
+
+        while let Poll::Ready(frame) = buf.poll_frame(MAX_FRAME_SIZE, &mut read) {
+            frame.expect("stream ended").expect("split error");
+            frames += 1;
         }
+        (frames, reads)
     }
 
     #[test]

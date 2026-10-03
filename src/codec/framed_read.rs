@@ -437,28 +437,10 @@ where
             return Poll::Ready(None);
         }
 
-        let res = self.poll_next_frame_inner(cx);
+        let read = |buf: &mut BytesMut| poll_read_buf(&mut self.inner, cx, buf);
+        let res = self.buf.poll_frame(self.max_frame_size, read);
         self.has_errored = matches!(res, Poll::Ready(Some(Err(_))));
         res
-    }
-
-    fn poll_next_frame_inner(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<BytesMut, Error>>> {
-        loop {
-            if let Some(frame) = self.buf.split_frame(self.max_frame_size)? {
-                return Poll::Ready(Some(Ok(frame)));
-            }
-
-            let read = |buf: &mut BytesMut| poll_read_buf(&mut self.inner, cx, buf);
-            if ready!(self.buf.read_with(read))? == 0 {
-                let remaining = !self.buf.is_empty();
-                return Poll::Ready(remaining.then(|| {
-                    Err(io::Error::new(io::ErrorKind::Other, "bytes remaining on stream").into())
-                }));
-            }
-        }
     }
 }
 
