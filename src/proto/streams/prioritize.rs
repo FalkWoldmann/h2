@@ -513,7 +513,7 @@ impl Prioritize {
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         // Reclaim any frame that has previously been written

@@ -45,7 +45,7 @@ impl Settings {
         streams: &mut Streams<C, P>,
     ) -> Result<(), Error>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
         C: Buf,
         P: Peer,
@@ -115,7 +115,7 @@ impl Settings {
         streams: &mut Streams<C, P>,
     ) -> Poll<Result<(), Error>>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
         C: Buf,
         P: Peer,

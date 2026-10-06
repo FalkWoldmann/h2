@@ -138,6 +138,7 @@
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
+use crate::io::{Read, Write};
 use crate::proto::{self, Error};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
 
@@ -148,7 +149,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::Instrument;
 
 /// Initializes new HTTP/2 streams on a connection by sending a request.
@@ -1251,7 +1251,7 @@ impl Builder {
         io: T,
     ) -> impl Future<Output = Result<(SendRequest<B>, Connection<T, B>), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Read + Write + Unpin,
         B: Buf,
     {
         Connection::handshake2(io, self.clone())
@@ -1301,7 +1301,7 @@ impl Default for Builder {
 /// ```
 pub async fn handshake<T>(io: T) -> Result<(SendRequest<Bytes>, Connection<T, Bytes>), crate::Error>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
 {
     let builder = Builder::new();
     builder
@@ -1314,12 +1314,20 @@ where
 
 async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
 {
     tracing::debug!("binding client connection");
 
-    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    io.write_all(msg).await.map_err(crate::Error::from_io)?;
+    let mut msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    while !msg.is_empty() {
+        let n = crate::poll_fn(|cx| Pin::new(&mut *io).poll_write(cx, msg))
+            .await
+            .map_err(crate::Error::from_io)?;
+        if n == 0 {
+            return Err(crate::Error::from_io(std::io::ErrorKind::WriteZero.into()));
+        }
+        msg = &msg[n..];
+    }
 
     tracing::debug!("client connection bound");
 
@@ -1328,7 +1336,7 @@ where
 
 impl<T, B> Connection<T, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Buf,
 {
     async fn handshake2(
@@ -1462,7 +1470,7 @@ where
 
 impl<T, B> Future for Connection<T, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Buf,
 {
     type Output = Result<(), crate::Error>;
@@ -1490,7 +1498,7 @@ where
 
 impl<T, B> fmt::Debug for Connection<T, B>
 where
-    T: AsyncRead + AsyncWrite,
+    T: Read + Write,
     T: fmt::Debug,
     B: fmt::Debug + Buf,
 {

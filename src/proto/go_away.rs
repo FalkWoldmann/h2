@@ -1,10 +1,10 @@
 use crate::codec::Codec;
 use crate::frame::{self, Reason, StreamId};
 
+use crate::io::Write;
 use bytes::Buf;
 use std::io;
 use std::task::{Context, Poll};
-use tokio::io::AsyncWrite;
 
 /// Manages our sending of GOAWAY frames.
 #[derive(Debug)]
@@ -123,7 +123,7 @@ impl GoAway {
         dst: &mut Codec<T, B>,
     ) -> Poll<Option<io::Result<Reason>>>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         if let Some(frame) = self.pending.take() {

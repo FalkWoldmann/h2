@@ -6,8 +6,8 @@ use crate::codec::UserError;
 use crate::frame::{self, Reason};
 use crate::proto::{self, Error, Initiator};
 
+use crate::io::Write;
 use bytes::Buf;
-use tokio::io::AsyncWrite;
 
 use std::cmp::Ordering;
 use std::io;
@@ -352,7 +352,7 @@ impl Send {
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         self.prioritize.buffer_pending(buffer, store, counts, dst)

@@ -11,12 +11,12 @@ use self::framed_write::FramedWrite;
 use crate::frame::{self, Data, Frame};
 use crate::proto::Error;
 
+use crate::io::{Read, Write};
 use bytes::Buf;
 use futures_core::Stream;
 use futures_sink::Sink;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use std::io;
 
@@ -27,7 +27,7 @@ pub struct Codec<T, B> {
 
 impl<T, B> Codec<T, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Buf,
 {
     /// Returns a new `Codec` with the default max frame size
@@ -120,7 +120,7 @@ impl<T, B> Codec<T, B> {
 
 impl<T, B> Codec<T, B>
 where
-    T: AsyncWrite + Unpin,
+    T: Write + Unpin,
     B: Buf,
 {
     /// Returns `Ready` when the codec can buffer a frame
@@ -157,7 +157,7 @@ where
 
 impl<T, B> Stream for Codec<T, B>
 where
-    T: AsyncRead + Unpin,
+    T: Read + Unpin,
 {
     type Item = Result<Frame, Error>;
 
@@ -168,7 +168,7 @@ where
 
 impl<T, B> Sink<Frame<B>> for Codec<T, B>
 where
-    T: AsyncWrite + Unpin,
+    T: Write + Unpin,
     B: Buf,
 {
     type Error = SendError;
@@ -196,7 +196,7 @@ where
 // TODO: remove (or improve) this
 impl<T> From<T> for Codec<T, bytes::Bytes>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
 {
     fn from(src: T) -> Self {
         Self::new(src)

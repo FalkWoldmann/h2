@@ -2,11 +2,11 @@ use crate::codec::UserError;
 use crate::codec::UserError::*;
 use crate::frame::{self, Frame, FrameSize};
 use crate::hpack;
+use crate::io::{Read, Write};
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use std::io::{self, Cursor, IoSlice};
 
@@ -20,7 +20,7 @@ macro_rules! limited_write_buf {
 
 #[derive(Debug)]
 pub struct FramedWrite<T, B> {
-    /// Upstream `AsyncWrite`
+    /// Upstream `Write`
     inner: T,
     final_flush_done: bool,
 
@@ -78,7 +78,7 @@ const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>
 where
-    T: AsyncWrite + Unpin,
+    T: Write + Unpin,
     B: Buf,
 {
     pub fn new(inner: T) -> FramedWrite<T, B> {
@@ -187,7 +187,7 @@ where
 
 /// Writes the chunks of `buf` to `io`, vectored if `io` supports it, and
 /// advances `buf` by the number of bytes written.
-fn poll_write_buf<T: AsyncWrite, B: Buf>(
+fn poll_write_buf<T: Write, B: Buf>(
     io: Pin<&mut T>,
     cx: &mut Context<'_>,
     buf: &mut B,
@@ -378,13 +378,13 @@ impl<T, B> FramedWrite<T, B> {
     }
 }
 
-impl<T: AsyncRead + Unpin, B> AsyncRead for FramedWrite<T, B> {
-    fn poll_read(
+impl<T: Read + Unpin, B> Read for FramedWrite<T, B> {
+    fn poll_read_buf(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        buf: &mut BytesMut,
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_read_buf(cx, buf)
     }
 }
 
@@ -482,7 +482,7 @@ mod tests {
         }
     }
 
-    impl AsyncWrite for Writer {
+    impl Write for Writer {
         fn poll_write(
             mut self: Pin<&mut Self>,
             _: &mut Context<'_>,

@@ -120,14 +120,14 @@ use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, Strea
 use crate::proto::{self, Config, Error, Prioritized};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
 
-use bytes::{Buf, Bytes};
+use crate::io::{Read, Write};
+use bytes::{Buf, Bytes, BytesMut};
 use http::{HeaderMap, Method, Request, Response};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use std::{fmt, io};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::instrument::{Instrument, Instrumented};
 
 /// In progress HTTP/2 connection handshake future.
@@ -328,7 +328,9 @@ struct Flush<T, B> {
 /// Read the client connection preface
 struct ReadPreface<T, B> {
     codec: Option<Codec<T, B>>,
-    pos: usize,
+    /// The preface bytes read so far. It keeps its capacity at the preface
+    /// length, so no bytes after the preface are read.
+    buf: BytesMut,
 }
 
 #[derive(Debug)]
@@ -369,7 +371,7 @@ const PREFACE: [u8; 24] = *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// ```
 pub fn handshake<T>(io: T) -> Handshake<T, Bytes>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
 {
     Builder::new().handshake(io)
 }
@@ -378,7 +380,7 @@ where
 
 impl<T, B> Connection<T, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Buf,
 {
     fn handshake2(io: T, builder: Builder) -> Handshake<T, B> {
@@ -602,7 +604,7 @@ where
 #[cfg(feature = "stream")]
 impl<T, B> futures_core::Stream for Connection<T, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Buf,
 {
     type Item = Result<(Request<RecvStream>, SendResponse<B>), crate::Error>;
@@ -1126,7 +1128,7 @@ impl Builder {
     /// ```
     pub fn handshake<T, B>(&self, io: T) -> Handshake<T, B>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Read + Write + Unpin,
         B: Buf,
     {
         Connection::handshake2(io, self.clone())
@@ -1416,7 +1418,7 @@ impl<T, B: Buf> Flush<T, B> {
 
 impl<T, B> Future for Flush<T, B>
 where
-    T: AsyncWrite + Unpin,
+    T: Write + Unpin,
     B: Buf,
 {
     type Output = Result<Codec<T, B>, crate::Error>;
@@ -1434,31 +1436,25 @@ impl<T, B: Buf> ReadPreface<T, B> {
     fn new(codec: Codec<T, B>) -> Self {
         ReadPreface {
             codec: Some(codec),
-            pos: 0,
+            buf: BytesMut::with_capacity(PREFACE.len()),
         }
-    }
-
-    fn inner_mut(&mut self) -> &mut T {
-        self.codec.as_mut().unwrap().get_mut()
     }
 }
 
 impl<T, B> Future for ReadPreface<T, B>
 where
-    T: AsyncRead + Unpin,
+    T: Read + Unpin,
     B: Buf,
 {
     type Output = Result<Codec<T, B>, crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut buf = [0; 24];
-        let mut rem = PREFACE.len() - self.pos;
-
-        while rem > 0 {
-            let mut buf = ReadBuf::new(&mut buf[..rem]);
-            ready!(Pin::new(self.inner_mut()).poll_read(cx, &mut buf))
+        let this = &mut *self;
+        while this.buf.len() < PREFACE.len() {
+            let pos = this.buf.len();
+            let io = this.codec.as_mut().unwrap().get_mut();
+            let n = ready!(Pin::new(io).poll_read_buf(cx, &mut this.buf))
                 .map_err(crate::Error::from_io)?;
-            let n = buf.filled().len();
             if n == 0 {
                 return Poll::Ready(Err(crate::Error::from_io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1466,14 +1462,11 @@ where
                 ))));
             }
 
-            if &PREFACE[self.pos..self.pos + n] != buf.filled() {
+            if PREFACE[pos..this.buf.len()] != this.buf[pos..] {
                 proto_err!(conn: "read_preface: invalid preface");
                 // TODO: Should this just write the GO_AWAY frame directly?
                 return Poll::Ready(Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into()));
             }
-
-            self.pos += n;
-            rem -= n; // TODO test
         }
 
         Poll::Ready(Ok(self.codec.take().unwrap()))
@@ -1484,7 +1477,7 @@ where
 
 impl<T, B: Buf> Future for Handshake<T, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Buf,
 {
     type Output = Result<Connection<T, B>, crate::Error>;
@@ -1558,7 +1551,7 @@ where
 
 impl<T, B> fmt::Debug for Handshake<T, B>
 where
-    T: AsyncRead + AsyncWrite + fmt::Debug,
+    T: Read + Write + fmt::Debug,
     B: fmt::Debug + Buf,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {

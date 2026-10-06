@@ -6,17 +6,16 @@ use crate::frame::{
 use crate::proto::Error;
 
 use crate::hpack;
+use crate::io::Read;
 
 use futures_core::Stream;
 
 use bytes::{Buf, BytesMut};
 
-use std::future::Future;
-use std::{io, mem};
+use std::mem;
 
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
@@ -425,7 +424,7 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
 
 impl<T> FramedRead<T>
 where
-    T: AsyncRead + Unpin,
+    T: Read + Unpin,
 {
     /// Reads from `inner` until a complete frame, head included, is buffered
     /// and splits it off.
@@ -437,7 +436,7 @@ where
             return Poll::Ready(None);
         }
 
-        let read = |buf: &mut BytesMut| poll_read_buf(&mut self.inner, cx, buf);
+        let read = |buf: &mut BytesMut| Pin::new(&mut self.inner).poll_read_buf(cx, buf);
         let res = self.buf.poll_frame(self.max_frame_size, read);
         self.has_errored = matches!(res, Poll::Ready(Some(Err(_))));
         res
@@ -446,7 +445,7 @@ where
 
 impl<T> Stream for FramedRead<T>
 where
-    T: AsyncRead + Unpin,
+    T: Read + Unpin,
 {
     type Item = Result<Frame, Error>;
 
@@ -467,17 +466,6 @@ where
             }
         }
     }
-}
-
-/// Reads from `io` into the spare capacity of `buf`.
-fn poll_read_buf<T: AsyncRead + Unpin>(
-    io: &mut T,
-    cx: &mut Context<'_>,
-    buf: &mut BytesMut,
-) -> Poll<io::Result<usize>> {
-    // `read_buf` is cancel safe, so a new future can be polled on every call
-    // and dropped when it returns `Pending`.
-    std::pin::pin!(io.read_buf(buf)).poll(cx)
 }
 
 // ===== impl Continuable =====

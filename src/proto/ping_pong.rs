@@ -2,13 +2,13 @@ use crate::codec::Codec;
 use crate::frame::Ping;
 use crate::proto::{self, PingPayload};
 
+use crate::io::Write;
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::AsyncWrite;
 
 /// Acknowledges ping requests from the remote.
 #[derive(Debug)]
@@ -141,7 +141,7 @@ impl PingPong {
         dst: &mut Codec<T, B>,
     ) -> Poll<io::Result<()>>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         if let Some(pong) = self.pending_pong.take() {
@@ -164,7 +164,7 @@ impl PingPong {
         dst: &mut Codec<T, B>,
     ) -> Poll<io::Result<()>>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         if let Some(ref mut ping) = self.pending_ping {

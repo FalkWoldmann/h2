@@ -7,10 +7,10 @@ use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
 use crate::{client, proto, server};
 
+use crate::io::Write;
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
 use std::task::{ready, Context, Poll, Waker};
-use tokio::io::AsyncWrite;
 
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
@@ -159,7 +159,7 @@ where
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
     {
         loop {
             let status = {
@@ -189,7 +189,7 @@ where
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
     {
         loop {
             // Make any required socket progress before taking stream locks.
@@ -967,7 +967,7 @@ impl Inner {
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         let mut send_buffer = send_buffer.inner.lock().unwrap();

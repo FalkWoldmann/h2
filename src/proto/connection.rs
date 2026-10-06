@@ -5,6 +5,7 @@ use crate::{client, server};
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
 
+use crate::io::Read;
 use bytes::Bytes;
 use futures_core::Stream;
 use std::io;
@@ -12,7 +13,6 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
-use tokio::io::AsyncRead;
 
 /// An H2 connection
 #[derive(Debug)]
@@ -120,7 +120,7 @@ enum State {
 
 impl<T, P, B> Connection<T, P, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     P: Peer,
     B: Buf,
 {
@@ -608,7 +608,7 @@ enum ReceivedFrame {
 
 impl<T, B> Connection<T, client::Peer, B>
 where
-    T: AsyncRead + AsyncWrite,
+    T: Read + Write,
     B: Buf,
 {
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
@@ -618,7 +618,7 @@ where
 
 impl<T, B> Connection<T, server::Peer, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Buf,
 {
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {

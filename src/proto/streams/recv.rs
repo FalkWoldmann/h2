@@ -1042,7 +1042,7 @@ impl Recv {
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         if let Some(stream_id) = self.refused {
@@ -1120,7 +1120,7 @@ impl Recv {
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         // Send any pending connection level window updates
@@ -1142,7 +1142,7 @@ impl Recv {
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         if let Some(incr) = self.flow.unclaimed_capacity() {
@@ -1174,7 +1174,7 @@ impl Recv {
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: Write + Unpin,
         B: Buf,
     {
         loop {
