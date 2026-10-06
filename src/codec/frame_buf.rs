@@ -29,6 +29,11 @@ pub(super) struct FrameBuf {
     frame_len: Option<usize>,
 
     read_size: ReadSize,
+
+    /// Space offered to a read that returned `Pending`. A completion-based
+    /// read may still hold the buffer, so until it completes the buffer is
+    /// neither split nor grown, and the next read gets the same buffer.
+    pending_read: Option<usize>,
 }
 
 impl FrameBuf {
@@ -45,8 +50,10 @@ impl FrameBuf {
         mut read: impl FnMut(&mut BytesMut) -> Poll<io::Result<usize>>,
     ) -> Poll<Option<Result<BytesMut, Error>>> {
         loop {
-            if let Some(frame) = self.split_frame(max_frame_size)? {
-                return Poll::Ready(Some(Ok(frame)));
+            if self.pending_read.is_none() {
+                if let Some(frame) = self.split_frame(max_frame_size)? {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
             }
 
             if ready!(self.read_with(&mut read))? == 0 {
@@ -105,18 +112,25 @@ impl FrameBuf {
         &mut self,
         read: impl FnOnce(&mut BytesMut) -> Poll<io::Result<usize>>,
     ) -> Poll<io::Result<usize>> {
-        let len = self.buf.len();
-        let (needed, capacity) = read_room(len, self.frame_len, self.read_size.get());
-        if self.spare() < needed {
-            self.buf.reserve(capacity - len);
-        }
+        let offered = match self.pending_read.take() {
+            Some(offered) => offered,
+            None => {
+                let len = self.buf.len();
+                let (needed, capacity) = read_room(len, self.frame_len, self.read_size.get());
+                if self.spare() < needed {
+                    self.buf.reserve(capacity - len);
+                }
+                self.spare()
+            }
+        };
 
-        let offered = self.spare();
         let res = read(&mut self.buf);
         match res {
             Poll::Ready(Ok(n)) => self.read_size.record_read(offered, n),
             Poll::Ready(Err(_)) => {}
-            Poll::Pending => self.release_if_idle(),
+            // A released buffer was not lent, so no read is in flight.
+            Poll::Pending if self.release_if_idle() => {}
+            Poll::Pending => self.pending_read = Some(offered),
         }
         res
     }
@@ -125,11 +139,13 @@ impl FrameBuf {
         self.buf.capacity() - self.buf.len()
     }
 
-    fn release_if_idle(&mut self) {
-        if self.buf.is_empty() && self.buf.capacity() > INITIAL_READ_SIZE {
+    fn release_if_idle(&mut self) -> bool {
+        let idle = self.buf.is_empty() && self.buf.capacity() > INITIAL_READ_SIZE;
+        if idle {
             self.buf = BytesMut::new();
             self.read_size.reset();
         }
+        idle
     }
 }
 
@@ -385,6 +401,70 @@ mod tests {
             frames += 1;
         }
         (frames, reads)
+    }
+
+    /// Reads like a completion-based runtime: takes the buffer when it
+    /// submits a read, stays pending for `polls` calls, then puts the buffer
+    /// back with up to `chunk` bytes appended.
+    ///
+    /// Returns the number of frames split off, and how many calls h2 made
+    /// with a read in flight where the buffer it passed was not the empty
+    /// one left behind (h2 touched a lent buffer).
+    fn feed_lending(
+        buf: &mut FrameBuf,
+        mut data: &[u8],
+        chunk: usize,
+        polls: usize,
+    ) -> (usize, usize) {
+        use std::cell::{Cell, RefCell};
+
+        let mut frames = 0;
+        let touched = Cell::new(0);
+        let lent: RefCell<Option<(BytesMut, usize)>> = RefCell::new(None);
+        let mut read = |buf: &mut BytesMut| {
+            let mut lent = lent.borrow_mut();
+            if let Some((_, left)) = lent.as_mut() {
+                if buf.capacity() != 0 || !buf.is_empty() {
+                    touched.set(touched.get() + 1);
+                }
+                if *left > 0 {
+                    *left -= 1;
+                    return Poll::Pending;
+                }
+                let (mut owned, _) = lent.take().unwrap();
+                let n = (owned.capacity() - owned.len()).min(chunk).min(data.len());
+                owned.extend_from_slice(&data[..n]);
+                data = &data[n..];
+                *buf = owned;
+                return Poll::Ready(Ok(n));
+            }
+            if data.is_empty() {
+                return Poll::Pending;
+            }
+            *lent = Some((std::mem::take(buf), polls));
+            Poll::Pending
+        };
+
+        loop {
+            match buf.poll_frame(MAX_FRAME_SIZE, &mut read) {
+                Poll::Ready(frame) => {
+                    frame.expect("stream ended").expect("split error");
+                    frames += 1;
+                }
+                Poll::Pending if lent.borrow().is_some() => {}
+                Poll::Pending => break,
+            }
+        }
+        (frames, touched.get())
+    }
+
+    #[test]
+    fn lent_buffer_is_not_touched() {
+        let mut buf = FrameBuf::default();
+        let data = frames(&[16_384, 4, 16_384, 100, 4]);
+        let (frames, touched) = feed_lending(&mut buf, &data, 1_000, 3);
+        assert_eq!(frames, 5);
+        assert_eq!(touched, 0, "h2 touched a lent buffer {} times", touched);
     }
 
     #[test]
