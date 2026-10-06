@@ -2,8 +2,9 @@
 //!
 //! [`client::handshake`](crate::client::handshake) and
 //! [`server::handshake`](crate::server::handshake) take any value that
-//! implements [`Read`], [`Write`] and [`Unpin`]. Every type implementing
-//! tokio's `AsyncRead` and `AsyncWrite` implements them.
+//! implements [`Read`], [`Write`] and [`Unpin`]. With the `tokio` feature (on
+//! by default), every type implementing tokio's `AsyncRead` and `AsyncWrite`
+//! implements them.
 //!
 //! The traits work on h2's own buffers, so a completion-based implementation
 //! (io_uring, IOCP) can take a buffer, submit it to the kernel and hand it
@@ -93,6 +94,7 @@ pub trait Write {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
+#[cfg(feature = "tokio")]
 mod tokio_impls {
     use super::{Read, Write};
 

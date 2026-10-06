@@ -20,6 +20,12 @@ edition = "2021"
 rust-version = "1.71"
 
 [features]
+default = ["tokio"]
+
+# Implements h2's I/O traits for every type implementing tokio's `AsyncRead`
+# and `AsyncWrite`.
+tokio = ["dep:tokio"]
+
 # Enables `futures::Stream` implementations for various types.
 stream = []
 
@@ -42,7 +48,7 @@ members = [
 atomic-waker = "1.0.0"
 futures-core = { version = "0.3", default-features = false }
 futures-sink = { version = "0.3", default-features = false }
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util"], optional = true }
 bytes = "1"
 http = "1.1"
 tracing = { version = "0.1.35", default-features = false, features = ["std"] }
