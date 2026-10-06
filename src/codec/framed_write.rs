@@ -8,13 +8,13 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use std::io::{self, Cursor, IoSlice};
+use std::io::{self, IoSlice};
 
 // A macro to get around a method needing to borrow &mut self
 macro_rules! limited_write_buf {
     ($self:expr) => {{
         let limit = $self.max_frame_size() + frame::HEADER_LEN;
-        $self.buf.get_mut().limit(limit)
+        (&mut $self.buf).limit(limit)
     }};
 }
 
@@ -32,10 +32,18 @@ struct Encoder<B> {
     /// HPACK encoder
     hpack: hpack::Encoder,
 
-    /// Write buffer
+    /// Write buffer. Written bytes are advanced past.
     ///
     /// TODO: Should this be a ring buffer?
-    buf: Cursor<BytesMut>,
+    buf: BytesMut,
+
+    /// `buf` is lent to an owned write that returned `Pending`; nothing may
+    /// be encoded into it until the write completes.
+    write_in_flight: bool,
+
+    /// The writer needs owned buffers, so DATA payloads are copied into
+    /// `buf` and written with `poll_write_owned`.
+    owned: bool,
 
     /// Next frame to encode
     next: Option<Next<B>>,
@@ -82,7 +90,8 @@ where
     B: Buf,
 {
     pub fn new(inner: T) -> FramedWrite<T, B> {
-        let chain_threshold = if inner.is_write_vectored() {
+        let owned = inner.needs_owned_buffers();
+        let chain_threshold = if inner.is_write_vectored() && !owned {
             CHAIN_THRESHOLD
         } else {
             CHAIN_THRESHOLD_WITHOUT_VECTORED_IO
@@ -92,11 +101,14 @@ where
             final_flush_done: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
-                buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
+                buf: BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY),
+                write_in_flight: false,
+                owned,
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
-                chain_threshold,
+                // Owned writes never chain a payload, they copy it.
+                chain_threshold: if owned { usize::MAX } else { chain_threshold },
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
         }
@@ -141,6 +153,10 @@ where
         loop {
             while !self.encoder.is_empty() {
                 let n = match self.encoder.next {
+                    _ if self.encoder.owned => {
+                        tracing::trace!(owned = true);
+                        ready!(self.poll_write_owned(cx))?
+                    }
                     Some(Next::Data(ref mut frame)) => {
                         tracing::trace!(queued_data_frame = true);
                         let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
@@ -173,6 +189,17 @@ where
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
 
         Poll::Ready(Ok(()))
+    }
+
+    /// Writes from the front of the buffer, lending it to the writer.
+    fn poll_write_owned(&mut self, cx: &mut Context) -> Poll<io::Result<usize>> {
+        let encoder = &mut self.encoder;
+        encoder.write_in_flight = true;
+        let n = ready!(Pin::new(&mut self.inner).poll_write_owned(cx, &mut encoder.buf));
+        encoder.write_in_flight = false;
+        let n = n?;
+        encoder.buf.advance(n);
+        Poll::Ready(Ok(n))
     }
 
     /// Close the codec
@@ -222,9 +249,9 @@ where
     B: Buf,
 {
     fn unset_frame(&mut self) -> ControlFlow {
-        // Clear internal buffer
-        self.buf.set_position(0);
-        self.buf.get_mut().clear();
+        // Clear internal buffer, reclaiming the space written from
+        self.buf.clear();
+        self.buf.reserve(DEFAULT_BUFFER_CAPACITY);
 
         // The data frame has been written, so unset it
         match self.next.take() {
@@ -266,17 +293,17 @@ where
                     let head = v.head();
 
                     // Encode the frame head to the buffer
-                    head.encode(len, self.buf.get_mut());
+                    head.encode(len, &mut self.buf);
 
-                    if self.buf.get_ref().remaining() < self.chain_threshold {
+                    if self.buf.len() < self.chain_threshold {
                         let extra_bytes = self.chain_threshold - self.buf.remaining();
-                        self.buf.get_mut().put(v.payload_mut().take(extra_bytes));
+                        self.buf.put(v.payload_mut().take(extra_bytes));
                     }
 
                     // Save the data frame
                     self.next = Some(Next::Data(v));
                 } else {
-                    v.encode_chunk(self.buf.get_mut());
+                    v.encode_chunk(&mut self.buf);
 
                     // The chunk has been fully encoded, so there is no need to
                     // keep it around
@@ -299,31 +326,31 @@ where
                 }
             }
             Frame::Settings(v) => {
-                v.encode(self.buf.get_mut());
+                v.encode(&mut self.buf);
                 tracing::trace!(rem = self.buf.remaining(), "encoded settings");
             }
             Frame::GoAway(v) => {
-                v.encode(self.buf.get_mut());
+                v.encode(&mut self.buf);
                 tracing::trace!(rem = self.buf.remaining(), "encoded go_away");
             }
             Frame::Ping(v) => {
-                v.encode(self.buf.get_mut());
+                v.encode(&mut self.buf);
                 tracing::trace!(rem = self.buf.remaining(), "encoded ping");
             }
             Frame::WindowUpdate(v) => {
-                v.encode(self.buf.get_mut());
+                v.encode(&mut self.buf);
                 tracing::trace!(rem = self.buf.remaining(), "encoded window_update");
             }
 
             Frame::Priority(_) => {
                 /*
-                v.encode(self.buf.get_mut());
+                v.encode(&mut self.buf);
                 tracing::trace!("encoded priority; rem={:?}", self.buf.remaining());
                 */
                 unimplemented!();
             }
             Frame::Reset(v) => {
-                v.encode(self.buf.get_mut());
+                v.encode(&mut self.buf);
                 tracing::trace!(rem = self.buf.remaining(), "encoded reset");
             }
         }
@@ -332,12 +359,15 @@ where
     }
 
     fn has_capacity(&self) -> bool {
-        self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+        !self.write_in_flight
+            && self.next.is_none()
+            && (self.buf.capacity() - self.buf.len() >= self.min_buffer_capacity)
     }
 
     fn is_empty(&self) -> bool {
+        if self.write_in_flight {
+            return false;
+        }
         match self.next {
             Some(Next::Data(ref frame)) => !frame.payload().has_remaining(),
             _ => !self.buf.has_remaining(),
