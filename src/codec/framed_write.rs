@@ -401,3 +401,110 @@ mod unstable {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+
+    /// Accepts at most `max` bytes per write, and records how many slices
+    /// each vectored write was given.
+    struct Writer {
+        written: Vec<u8>,
+        max: usize,
+        vectored: bool,
+        slices: Vec<usize>,
+    }
+
+    impl AsyncWrite for Writer {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = buf.len().min(self.max);
+            self.written.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            assert!(self.vectored, "vectored write to a writer without support");
+            self.slices.push(bufs.len());
+            let mut n = 0;
+            for buf in bufs {
+                let take = buf.len().min(self.max - n);
+                self.written.extend_from_slice(&buf[..take]);
+                n += take;
+            }
+            Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.vectored
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct NoopWaker;
+
+    impl Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// Flushes a DATA frame whose payload is large enough to be chained after
+    /// the frame head instead of copied, through a writer that accepts at
+    /// most `max` bytes at a time. Returns the writer and the expected bytes.
+    fn flush_chained_data(vectored: bool, max: usize) -> (Writer, Vec<u8>) {
+        let payload: Bytes = (0..4_000u32).map(|i| i as u8).collect();
+        let mut framed = FramedWrite::new(Writer {
+            written: Vec::new(),
+            max,
+            vectored,
+            slices: Vec::new(),
+        });
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(framed.poll_ready(&mut cx).is_ready());
+        let mut data = frame::Data::new(1.into(), payload.clone());
+        data.set_end_stream(true);
+        framed.buffer(data.into()).unwrap();
+        assert!(matches!(framed.flush(&mut cx), Poll::Ready(Ok(()))));
+
+        // Payload length 4000, DATA, END_STREAM, stream 1
+        let mut expected = vec![0, 0x0f, 0xa0, 0, 1, 0, 0, 0, 1];
+        expected.extend_from_slice(&payload);
+        (framed.inner, expected)
+    }
+
+    #[test]
+    fn flush_writes_chained_payload_vectored() {
+        for max in [1, 7, 4_096, usize::MAX] {
+            let (writer, expected) = flush_chained_data(true, max);
+            assert_eq!(writer.written, expected, "max {}", max);
+            // The frame head and the payload go out in one vectored write.
+            assert!(writer.slices.contains(&2), "max {}", max);
+        }
+    }
+
+    #[test]
+    fn flush_writes_chained_payload_without_vectored_io() {
+        for max in [1, 7, 4_096, usize::MAX] {
+            let (writer, expected) = flush_chained_data(false, max);
+            assert_eq!(writer.written, expected, "max {}", max);
+        }
+    }
+}
