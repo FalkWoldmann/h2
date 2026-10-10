@@ -20,8 +20,12 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
 
-/// Initial capacity of the read buffer.
-const INITIAL_READ_CAPACITY: usize = 8 * 1024;
+/// Capacity of the read buffer between frames, and the least room for a read
+/// past a frame that does not fit it.
+const READ_SIZE: usize = 8 * 1024;
+
+/// Most room for frames following a frame that does not fit the read buffer.
+const MAX_READ_AHEAD: usize = 64 * 1024;
 
 /// Length of the payload length field at the start of the frame header.
 const LENGTH_FIELD_LEN: usize = 3;
@@ -36,6 +40,9 @@ pub struct FramedRead<T> {
     /// Total length (head and payload) of the frame at the front of `buf`,
     /// set once its length field has been checked against the max frame size
     frame_len: Option<usize>,
+
+    /// `buf` was grown past `READ_SIZE` for a large frame
+    grown: bool,
 
     /// An error was returned, so the next poll returns `None`
     has_errored: bool,
@@ -80,8 +87,9 @@ impl<T> FramedRead<T> {
         let max_frame_size = DEFAULT_MAX_FRAME_SIZE as usize;
         FramedRead {
             inner,
-            buf: BytesMut::with_capacity(INITIAL_READ_CAPACITY),
+            buf: BytesMut::new(),
             frame_len: None,
+            grown: false,
             has_errored: false,
             max_frame_size,
             decoder: FrameDecoder::new(max_frame_size),
@@ -465,10 +473,14 @@ where
                 return Poll::Ready(Some(Ok(bytes)));
             }
 
-            // Make sure there is room for at least one byte, so a read of 0
-            // bytes means EOF.
-            self.buf.reserve(1);
-            if ready!(poll_read_buf(&mut self.inner, cx, &mut self.buf))? == 0 {
+            self.reserve_for_read();
+            let res = poll_read_buf(&mut self.inner, cx, &mut self.buf);
+            if res.is_pending() && self.grown && self.buf.is_empty() {
+                // Don't keep a buffer grown for large frames while idle
+                self.buf = BytesMut::new();
+                self.grown = false;
+            }
+            if ready!(res)? == 0 {
                 return if self.buf.is_empty() {
                     Poll::Ready(None)
                 } else {
@@ -499,7 +511,6 @@ where
                 }
 
                 let frame_len = payload_len + frame::HEADER_LEN;
-                self.buf.reserve(frame_len.saturating_sub(self.buf.len()));
                 self.frame_len = Some(frame_len);
                 frame_len
             }
@@ -510,13 +521,33 @@ where
         }
 
         self.frame_len = None;
-        let bytes = self.buf.split_to(frame_len);
+        Ok(Some(self.buf.split_to(frame_len)))
+    }
 
-        // Make sure there is room to read the next frame head
-        self.buf
-            .reserve(frame::HEADER_LEN.saturating_sub(self.buf.len()));
-
-        Ok(Some(bytes))
+    /// Makes room for the next read, so that a read of 0 bytes means EOF.
+    ///
+    /// Frames split off earlier may still share the buffer, and growing it
+    /// then copies what is buffered into a new allocation. So it only grows
+    /// when the frame at the front does not fit, or when there is no room
+    /// left between frames.
+    fn reserve_for_read(&mut self) {
+        let len = self.buf.len();
+        let spare = self.buf.capacity() - len;
+        // `split_frame` found no complete frame, so a known frame length
+        // exceeds `len`, and otherwise `len` is below `LENGTH_FIELD_LEN`.
+        let capacity = match self.frame_len {
+            // Room for up to four more frames of the same length. DATA frames
+            // mostly come in runs at the max frame size, and whole frames
+            // leave no partial frame to copy into the next allocation.
+            Some(frame_len) if spare < frame_len - len => {
+                let more = frame_len * (MAX_READ_AHEAD / frame_len).min(4);
+                frame_len + more.max(READ_SIZE)
+            }
+            None if spare < frame::HEADER_LEN => READ_SIZE,
+            _ => return,
+        };
+        self.buf.reserve(capacity - len);
+        self.grown |= capacity > READ_SIZE;
     }
 }
 
@@ -600,5 +631,229 @@ impl<T> From<Continuable> for Frame<T> {
                 push.into()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BufMut;
+    use quickcheck::{Arbitrary, Gen, QuickCheck};
+    use std::collections::VecDeque;
+    use std::ops::Range;
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+    use tokio::io::ReadBuf;
+
+    /// Reads `data` at most `max_read` bytes at a time, and is pending once
+    /// at each offset in `breaks`, like a socket that was drained.
+    struct Script {
+        data: Vec<u8>,
+        pos: usize,
+        max_read: usize,
+        breaks: VecDeque<usize>,
+        reads: usize,
+    }
+
+    impl Script {
+        fn new(data: Vec<u8>, max_read: usize, breaks: impl IntoIterator<Item = usize>) -> Self {
+            let mut breaks: Vec<usize> = breaks.into_iter().collect();
+            breaks.sort_unstable();
+            breaks.dedup();
+            Script {
+                data,
+                pos: 0,
+                max_read,
+                breaks: breaks.into(),
+                reads: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for Script {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            assert!(buf.remaining() > 0, "a read must have room");
+            if self.breaks.front() == Some(&self.pos) {
+                self.breaks.pop_front();
+                return Poll::Pending;
+            }
+            let end = self.breaks.front().copied().unwrap_or(self.data.len());
+            let n = buf.remaining().min(self.max_read).min(end - self.pos);
+            let pos = self.pos;
+            buf.put_slice(&self.data[pos..pos + n]);
+            self.pos += n;
+            self.reads += (n > 0) as usize;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct NoopWaker;
+
+    impl Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// Encodes frames with payloads of the given lengths and distinct
+    /// contents, returning where each one is.
+    fn encode(payload_lens: &[usize]) -> (Vec<u8>, Vec<Range<usize>>) {
+        let mut data = Vec::new();
+        let mut frames = Vec::new();
+        for (i, &len) in payload_lens.iter().enumerate() {
+            let start = data.len();
+            data.put_uint(len as u64, LENGTH_FIELD_LEN);
+            data.put_u8(0);
+            data.put_u8(0);
+            data.put_u32(i as u32);
+            data.extend((0..len).map(|j| (i * 31 + j) as u8));
+            frames.push(start..data.len());
+        }
+        (data, frames)
+    }
+
+    /// Polls until a read is pending, keeping every frame like the recv
+    /// queues of a connection do. Returns whether the stream ended.
+    fn poll_until_pending(framed: &mut FramedRead<Script>, frames: &mut Vec<BytesMut>) -> bool {
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match framed.poll_next_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => frames.push(frame),
+                Poll::Ready(Some(Err(e))) => panic!("{:?}", e),
+                Poll::Ready(None) => return true,
+                Poll::Pending => return false,
+            }
+        }
+    }
+
+    #[test]
+    fn large_frames_take_few_reads() {
+        let (data, _) = encode(&[16_384; 64]);
+        let mut framed = FramedRead::new(Script::new(data, usize::MAX, None));
+        let mut frames = Vec::new();
+        assert!(poll_until_pending(&mut framed, &mut frames));
+        assert_eq!(frames.len(), 64);
+        // Room for whole frames lets one read cover several of them. Reads
+        // of 8 KiB, as before, take two for each frame, and room for a single
+        // frame one.
+        assert!(framed.inner.reads <= 40, "{} reads", framed.inner.reads);
+    }
+
+    #[test]
+    fn small_frames_reuse_room_after_pending() {
+        let (data, frames_at) = encode(&[100; 20]);
+        let idle = frames_at[9].end;
+        let mut framed = FramedRead::new(Script::new(data, usize::MAX, [idle]));
+        let mut frames = Vec::new();
+        assert!(!poll_until_pending(&mut framed, &mut frames));
+        assert!(poll_until_pending(&mut framed, &mut frames));
+        assert_eq!(frames.len(), 20);
+        // The frames before the pending read are still held, yet the frames
+        // after it are read into the same allocation, right after them.
+        let (before, after) = (&frames[9], &frames[10]);
+        assert_eq!(before.as_ptr().wrapping_add(before.len()), after.as_ptr());
+    }
+
+    #[test]
+    fn partial_frames_that_fit_do_not_grow_the_buffer() {
+        let (data, _) = encode(&[100; 50]);
+        let mut framed = FramedRead::new(Script::new(data, 100, None));
+        let mut frames = Vec::new();
+        assert!(poll_until_pending(&mut framed, &mut frames));
+        assert_eq!(frames.len(), 50);
+        // Reads end inside frames, but every frame fits in the initial room,
+        // so the buffer never grows past it.
+        let consumed: usize = frames.iter().map(|frame| frame.len()).sum();
+        assert_eq!(framed.buf.capacity() + consumed, READ_SIZE);
+    }
+
+    #[test]
+    fn grown_buffer_is_released_when_idle() {
+        let (data, frames_at) = encode(&[16_384, 16_384, 10]);
+        let idle = frames_at[1].end;
+        let mut framed = FramedRead::new(Script::new(data, usize::MAX, [idle]));
+        let mut frames = Vec::new();
+        assert!(!poll_until_pending(&mut framed, &mut frames));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(framed.buf.capacity(), 0);
+        assert!(poll_until_pending(&mut framed, &mut frames));
+        assert_eq!(frames.len(), 3);
+    }
+
+    #[derive(Clone, Debug)]
+    struct ReadPlan {
+        payload_lens: Vec<usize>,
+        max_frame_size: usize,
+        max_read: usize,
+        breaks: Vec<usize>,
+        /// Whether each frame is kept or dropped right away, cycled
+        keep: Vec<bool>,
+    }
+
+    impl Arbitrary for ReadPlan {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let max_frame_size = *g.choose(&[16_384, 100_000]).unwrap();
+            let frames = usize::arbitrary(g) % 24;
+            let payload_lens = (0..frames)
+                .map(|_| usize::arbitrary(g) % g.choose(&[64, 4_096, max_frame_size + 1]).unwrap())
+                .collect();
+            let max_read = *g
+                .choose(&[100, 1_000, 16_384, 100_000, usize::MAX])
+                .unwrap();
+            let breaks = (0..usize::arbitrary(g) % 8)
+                .map(|_| usize::arbitrary(g))
+                .collect();
+            let keep = (0..1 + usize::arbitrary(g) % 8)
+                .map(|_| bool::arbitrary(g))
+                .collect();
+            ReadPlan {
+                payload_lens,
+                max_frame_size,
+                max_read,
+                breaks,
+                keep,
+            }
+        }
+    }
+
+    /// However the stream is cut into reads and pending reads, frames come
+    /// out whole, in order and unchanged. Frames that are kept alive, and so
+    /// share the buffer with later reads, stay unchanged too.
+    #[test]
+    fn frames_survive_any_read_pattern() {
+        fn prop(plan: ReadPlan) -> bool {
+            let (data, frames_at) = encode(&plan.payload_lens);
+            let breaks = plan.breaks.iter().map(|b| b % (data.len() + 1));
+            let mut framed = FramedRead::new(Script::new(data.clone(), plan.max_read, breaks));
+            framed.set_max_frame_size(plan.max_frame_size);
+            let waker = Waker::from(Arc::new(NoopWaker));
+            let mut cx = Context::from_waker(&waker);
+            let mut kept = Vec::new();
+            let mut next = 0;
+            loop {
+                match framed.poll_next_frame(&mut cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        match frames_at.get(next) {
+                            Some(at) if frame[..] == data[at.clone()] => {}
+                            _ => return false,
+                        }
+                        if plan.keep[next % plan.keep.len()] {
+                            kept.push((frame, frames_at[next].clone()));
+                        }
+                        next += 1;
+                    }
+                    Poll::Ready(Some(Err(_))) => return false,
+                    Poll::Ready(None) => break,
+                    Poll::Pending => {}
+                }
+            }
+            next == frames_at.len() && kept.into_iter().all(|(f, at)| f[..] == data[at])
+        }
+        QuickCheck::new()
+            .tests(500)
+            .quickcheck(prop as fn(ReadPlan) -> bool)
     }
 }
