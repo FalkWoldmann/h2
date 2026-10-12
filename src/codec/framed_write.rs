@@ -4,7 +4,7 @@ use crate::frame::{self, Frame, FrameSize};
 use crate::hpack;
 use crate::io::{Read, Write};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
@@ -37,13 +37,21 @@ struct Encoder<B> {
     /// TODO: Should this be a ring buffer?
     buf: BytesMut,
 
-    /// `buf` is lent to an owned write that returned `Pending`; nothing may
-    /// be encoded into it until the write completes.
-    write_in_flight: bool,
-
-    /// The writer needs owned buffers, so DATA payloads are copied into
-    /// `buf` and written with `poll_write_owned`.
+    /// The writer needs owned buffers, so frames are written with
+    /// `poll_write_owned`.
     owned: bool,
+
+    /// What an owned write is writing. The buffers before `writing_pos` are
+    /// written.
+    writing: Vec<Bytes>,
+    writing_pos: usize,
+
+    /// What the next owned write writes, in order: bytes split off `buf`,
+    /// and the payloads of DATA frames.
+    queued: Vec<Bytes>,
+
+    /// The bytes in `queued` and those `writing` has left to write.
+    owned_pending: usize,
 
     /// Next frame to encode
     next: Option<Next<B>>,
@@ -83,6 +91,14 @@ const CHAIN_THRESHOLD: usize = 256;
 /// fragmented data being sent, and hereby improve the throughput.
 const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
 
+/// Flush an owned write before this many buffers are queued for it.
+const MAX_QUEUED_BUFS: usize = 32;
+
+/// Accept no more frames while an owned write has this many bytes queued or
+/// left to write. Frames are accounted as sent once they are queued, so this
+/// bounds what sits in the codec.
+const MAX_OWNED_PENDING: usize = 256 * 1024;
+
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>
 where
@@ -91,7 +107,7 @@ where
 {
     pub fn new(inner: T) -> FramedWrite<T, B> {
         let owned = inner.needs_owned_buffers();
-        let chain_threshold = if inner.is_write_vectored() && !owned {
+        let chain_threshold = if inner.is_write_vectored() || owned {
             CHAIN_THRESHOLD
         } else {
             CHAIN_THRESHOLD_WITHOUT_VECTORED_IO
@@ -102,13 +118,15 @@ where
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY),
-                write_in_flight: false,
                 owned,
+                writing: Vec::new(),
+                writing_pos: 0,
+                queued: Vec::new(),
+                owned_pending: 0,
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
-                // Owned writes never chain a payload, they copy it.
-                chain_threshold: if owned { usize::MAX } else { chain_threshold },
+                chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
         }
@@ -191,14 +209,14 @@ where
         Poll::Ready(Ok(()))
     }
 
-    /// Writes from the front of the buffer, lending it to the writer.
+    /// Writes what is buffered as owned buffers, which the writer can keep
+    /// across a `Pending`.
     fn poll_write_owned(&mut self, cx: &mut Context) -> Poll<io::Result<usize>> {
         let encoder = &mut self.encoder;
-        encoder.write_in_flight = true;
-        let n = ready!(Pin::new(&mut self.inner).poll_write_owned(cx, &mut encoder.buf));
-        encoder.write_in_flight = false;
-        let n = n?;
-        encoder.buf.advance(n);
+        encoder.fill_writing();
+        let bufs = &encoder.writing[encoder.writing_pos..];
+        let n = ready!(Pin::new(&mut self.inner).poll_write_owned(cx, bufs))?;
+        encoder.advance_writing(n);
         Poll::Ready(Ok(n))
     }
 
@@ -248,6 +266,46 @@ impl<B> Encoder<B>
 where
     B: Buf,
 {
+    /// Queues what is in `buf` for the next owned write.
+    fn queue_buf(&mut self) {
+        if !self.buf.is_empty() {
+            let buf = self.buf.split().freeze();
+            self.queue(buf);
+        }
+    }
+
+    fn queue(&mut self, buf: Bytes) {
+        self.owned_pending += buf.len();
+        self.queued.push(buf);
+    }
+
+    /// Moves what is queued to `writing`, once the previous owned write is
+    /// through.
+    fn fill_writing(&mut self) {
+        if self.writing_pos < self.writing.len() {
+            return;
+        }
+        self.writing.clear();
+        self.writing_pos = 0;
+        self.queue_buf();
+        std::mem::swap(&mut self.writing, &mut self.queued);
+    }
+
+    fn advance_writing(&mut self, mut n: usize) {
+        self.owned_pending -= n;
+        while n > 0 {
+            let buf = &mut self.writing[self.writing_pos];
+            if n < buf.len() {
+                buf.advance(n);
+                break;
+            }
+            n -= buf.len();
+            // Drop the handle, so `buf` can reclaim the memory
+            *buf = Bytes::new();
+            self.writing_pos += 1;
+        }
+    }
+
     fn unset_frame(&mut self) -> ControlFlow {
         // Clear internal buffer, reclaiming the space written from
         self.buf.clear();
@@ -289,7 +347,15 @@ where
                     return Err(PayloadTooBig);
                 }
 
-                if len >= self.chain_threshold {
+                if len >= self.chain_threshold && self.owned {
+                    // Queue the payload as it is. Like a chunk encoded to the
+                    // buffer, it is on its way from here on.
+                    v.head().encode(len, &mut self.buf);
+                    self.queue_buf();
+                    let payload = v.payload_mut().copy_to_bytes(len);
+                    self.queue(payload);
+                    self.last_data_frame = Some(v);
+                } else if len >= self.chain_threshold {
                     let head = v.head();
 
                     // Encode the frame head to the buffer
@@ -359,13 +425,14 @@ where
     }
 
     fn has_capacity(&self) -> bool {
-        !self.write_in_flight
-            && self.next.is_none()
+        self.next.is_none()
             && (self.buf.capacity() - self.buf.len() >= self.min_buffer_capacity)
+            && self.queued.len() < MAX_QUEUED_BUFS
+            && self.owned_pending < MAX_OWNED_PENDING
     }
 
     fn is_empty(&self) -> bool {
-        if self.write_in_flight {
+        if self.writing_pos < self.writing.len() || !self.queued.is_empty() {
             return false;
         }
         match self.next {

@@ -11,7 +11,7 @@
 //! back once the operation completes, instead of copying through a buffer of
 //! its own.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 use std::io::{self, IoSlice};
 use std::pin::Pin;
@@ -24,13 +24,15 @@ pub trait Read {
     ///
     /// # Lending
     ///
-    /// An implementation may take `buf` (for example with `mem::take`) when
-    /// it submits a read, so the kernel can write into it after this call
-    /// returns `Pending`. It must put the buffer back, with the new bytes
-    /// appended, before returning `Ready`, and on an error too.
+    /// An implementation may detach the spare capacity of `buf` (with
+    /// `split_off(buf.len())`) when it submits a read, so the kernel can
+    /// write into it after this call returns `Pending`. It must put it back
+    /// (with `unsplit`), with the new bytes appended, before returning
+    /// `Ready`, and on an error too. The bytes already in `buf` stay in
+    /// place.
     ///
-    /// After `Pending`, h2 does not look at or change `buf` and passes the
-    /// same `buf` to the next call.
+    /// After `Pending`, h2 does not change `buf` and passes the same `buf` to
+    /// the next call.
     fn poll_read_buf(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -69,22 +71,32 @@ pub trait Write {
 
     /// Whether this writer needs owned buffers, as completion-based I/O does.
     ///
-    /// When `true`, h2 copies DATA payloads into its own buffer and writes
-    /// only through [`Write::poll_write_owned`].
+    /// When `true`, h2 writes only through [`Write::poll_write_owned`].
     fn needs_owned_buffers(&self) -> bool {
         false
     }
 
-    /// Writes from the front of `buf` and returns how many bytes were
-    /// written. h2 advances `buf` by that number.
+    /// Writes from `bufs`, in order, and returns how many bytes were written.
     ///
-    /// The lending rules of [`Read::poll_read_buf`] apply.
+    /// `bufs` are reference counted, so an implementation can clone them into
+    /// an operation that outlives this call. After `Pending`, h2 passes the
+    /// same `bufs` again. An implementation must drop its clones before it
+    /// returns `Ready`, so h2 can reuse the memory.
+    ///
+    /// The default writes with [`Write::poll_write_vectored`].
     fn poll_write_owned(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut BytesMut,
+        bufs: &[Bytes],
     ) -> Poll<io::Result<usize>> {
-        self.poll_write(cx, &buf[..])
+        const MAX_BUFS: usize = 8;
+        let mut slices = [IoSlice::new(&[]); MAX_BUFS];
+        let mut n = 0;
+        for (slot, buf) in slices.iter_mut().zip(bufs.iter().filter(|b| !b.is_empty())) {
+            *slot = IoSlice::new(buf);
+            n += 1;
+        }
+        self.poll_write_vectored(cx, &slices[..n])
     }
 
     /// Flushes buffered bytes to the sink.

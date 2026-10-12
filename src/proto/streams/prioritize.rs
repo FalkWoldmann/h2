@@ -942,6 +942,10 @@ where
     fn advance(&mut self, cnt: usize) {
         self.inner.advance(cnt)
     }
+
+    fn copy_to_bytes(&mut self, len: usize) -> bytes::Bytes {
+        self.inner.copy_to_bytes(len)
+    }
 }
 
 impl<B: Buf> fmt::Debug for Prioritized<B> {

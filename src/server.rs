@@ -1462,7 +1462,7 @@ where
                 ))));
             }
 
-            if PREFACE[pos..this.buf.len()] != this.buf[pos..] {
+            if PREFACE.get(pos..this.buf.len()) != Some(&this.buf[pos..]) {
                 proto_err!(conn: "read_preface: invalid preface");
                 // TODO: Should this just write the GO_AWAY frame directly?
                 return Poll::Ready(Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into()));

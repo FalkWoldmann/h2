@@ -1318,15 +1318,22 @@ where
 {
     tracing::debug!("binding client connection");
 
-    let mut msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let mut msg = Bytes::from_static(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     while !msg.is_empty() {
-        let n = crate::poll_fn(|cx| Pin::new(&mut *io).poll_write(cx, msg))
-            .await
-            .map_err(crate::Error::from_io)?;
+        let n = crate::poll_fn(|cx| {
+            let io = Pin::new(&mut *io);
+            if io.needs_owned_buffers() {
+                io.poll_write_owned(cx, std::slice::from_ref(&msg))
+            } else {
+                io.poll_write(cx, &msg)
+            }
+        })
+        .await
+        .map_err(crate::Error::from_io)?;
         if n == 0 {
             return Err(crate::Error::from_io(std::io::ErrorKind::WriteZero.into()));
         }
-        msg = &msg[n..];
+        msg.advance(n);
     }
 
     tracing::debug!("client connection bound");

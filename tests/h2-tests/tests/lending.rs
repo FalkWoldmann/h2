@@ -1,7 +1,9 @@
 //! Runs a client and server over an in-memory pipe that implements only
-//! `h2::io` and behaves like completion-based I/O: it takes h2's buffer when
-//! a read or write is submitted, completes on a later poll and hands the
-//! buffer back. h2 must not touch a buffer while it is lent.
+//! `h2::io` and behaves like completion-based I/O: a read takes the spare
+//! capacity of h2's buffer when it is submitted, completes on a later poll
+//! and hands it back. A write keeps clones of h2's buffers while it is in
+//! flight. h2 must not change a buffer while a read is in flight, and must
+//! pass the same buffers again to a write in flight.
 
 use h2_support::prelude::{h2, http, Bytes, BytesMut};
 use std::cell::RefCell;
@@ -22,10 +24,11 @@ struct Queue {
 struct End {
     rx: Rc<RefCell<Queue>>,
     tx: Rc<RefCell<Queue>>,
-    /// The buffer h2 lent to the read in flight.
-    lent: Option<BytesMut>,
-    /// The buffer h2 lent to the write in flight.
-    lent_write: Option<BytesMut>,
+    /// The spare capacity h2 lent to the read in flight, and the length of
+    /// its buffer at that time.
+    lent: Option<(BytesMut, usize)>,
+    /// The buffers of the write in flight.
+    lent_write: Option<Vec<Bytes>>,
     stats: Rc<RefCell<Stats>>,
 }
 
@@ -33,13 +36,17 @@ struct End {
 struct Stats {
     submitted: usize,
     completed: usize,
-    /// Polls with a read in flight where h2 passed something other than the
-    /// empty buffer it was left with.
+    /// Polls with a read in flight where h2 passed a buffer it had changed.
     touched: usize,
     writes_submitted: usize,
     writes_completed: usize,
+    /// Polls with a write in flight where h2 passed other buffers.
     write_touched: usize,
     borrowed_writes: usize,
+    /// The address range of the request body.
+    body: std::ops::Range<usize>,
+    /// Bytes written straight from the request body, without a copy.
+    body_bytes_zero_copy: usize,
 }
 
 fn pipe() -> (End, End, Rc<RefCell<Stats>>) {
@@ -72,26 +79,27 @@ impl h2::io::Read for End {
         buf: &mut BytesMut,
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
-        let Some(mut owned) = this.lent.take() else {
-            // Submit: take the buffer and complete on a later poll, even if
-            // bytes are already there, so every read goes through lending.
-            this.lent = Some(std::mem::take(buf));
+        let Some((mut spare, len)) = this.lent.take() else {
+            // Submit: take the spare capacity and complete on a later poll,
+            // even if bytes are already there, so every read goes through
+            // lending.
+            this.lent = Some((buf.split_off(buf.len()), buf.len()));
             this.stats.borrow_mut().submitted += 1;
             cx.waker().wake_by_ref();
             return Poll::Pending;
         };
-        if buf.capacity() != 0 || !buf.is_empty() {
+        if buf.len() != len || buf.capacity() != len {
             this.stats.borrow_mut().touched += 1;
         }
         let mut rx = this.rx.borrow_mut();
         if rx.bytes.is_empty() && !rx.closed {
             rx.reader = Some(cx.waker().clone());
-            this.lent = Some(owned);
+            this.lent = Some((spare, len));
             return Poll::Pending;
         }
-        let n = (owned.capacity() - owned.len()).min(rx.bytes.len());
-        owned.extend(rx.bytes.drain(..n));
-        *buf = owned;
+        let n = spare.capacity().min(rx.bytes.len());
+        spare.extend(rx.bytes.drain(..n));
+        buf.unsplit(spare);
         this.stats.borrow_mut().completed += 1;
         Poll::Ready(Ok(n))
     }
@@ -105,31 +113,41 @@ impl h2::io::Write for End {
     fn poll_write_owned(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut BytesMut,
+        bufs: &[Bytes],
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         let Some(owned) = this.lent_write.take() else {
-            this.lent_write = Some(std::mem::take(buf));
+            this.lent_write = Some(bufs.to_vec());
             this.stats.borrow_mut().writes_submitted += 1;
             cx.waker().wake_by_ref();
             return Poll::Pending;
         };
-        if buf.capacity() != 0 || !buf.is_empty() {
+        let same = owned.len() == bufs.len()
+            && owned
+                .iter()
+                .zip(bufs)
+                .all(|(a, b)| a.as_ptr() == b.as_ptr() && a.len() == b.len());
+        if !same {
             this.stats.borrow_mut().write_touched += 1;
         }
         // Complete with a partial write now and then.
-        let n = if owned.len() > 1000 {
-            owned.len() - 7
-        } else {
-            owned.len()
-        };
+        let len: usize = owned.iter().map(Bytes::len).sum();
+        let n = if len > 1000 { len - 7 } else { len };
         let mut tx = this.tx.borrow_mut();
-        tx.bytes.extend(&owned[..n]);
+        let mut stats = this.stats.borrow_mut();
+        let mut rest = n;
+        for buf in &owned {
+            let take = rest.min(buf.len());
+            tx.bytes.extend(&buf[..take]);
+            if take > 0 && stats.body.contains(&(buf.as_ptr() as usize)) {
+                stats.body_bytes_zero_copy += take;
+            }
+            rest -= take;
+        }
         if let Some(w) = tx.reader.take() {
             w.wake();
         }
-        *buf = owned;
-        this.stats.borrow_mut().writes_completed += 1;
+        stats.writes_completed += 1;
         Poll::Ready(Ok(n))
     }
 
@@ -188,6 +206,7 @@ async fn lending_pipe_echo() {
 
     let body: Bytes = (0..200_000u32).map(|i| i as u8).collect::<Vec<u8>>().into();
     let expected = body.clone();
+    stats.borrow_mut().body = body.as_ptr_range().start as usize..body.as_ptr_range().end as usize;
     let done = local
         .run_until(async move {
             let (mut client, conn) = h2::client::handshake(client_io).await.unwrap();
@@ -225,5 +244,13 @@ async fn lending_pipe_echo() {
         stats
     );
     assert_eq!(stats.touched, 0, "h2 touched a lent buffer");
-    assert_eq!(stats.write_touched, 0, "h2 touched a lent write buffer");
+    assert_eq!(stats.write_touched, 0, "h2 changed the buffers of a write");
+    assert_eq!(stats.borrowed_writes, 0, "h2 wrote from a borrowed buffer");
+    // Every DATA frame of at least the chain threshold goes out without a
+    // copy, and the body is sent in far bigger pieces than that.
+    assert!(
+        stats.body_bytes_zero_copy > expected.len() * 9 / 10,
+        "only {} body bytes were written without a copy",
+        stats.body_bytes_zero_copy
+    );
 }
